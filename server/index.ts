@@ -1,0 +1,395 @@
+import "./env";
+import { initServerSentry, setupSentryExpressErrorHandler } from "./sentry-init";
+import express, { type Request, Response, NextFunction } from "express";
+import { registerRoutes } from "./routes";
+import { serveStatic } from "./static";
+import { createServer } from "http";
+import { heatmapWSManager } from "./heatmap-ws";
+import { attachCommandCenterDebugWs } from "./admin-debug-ws";
+import { attachSupportChatWs } from "./support-chat-ws";
+import { runMigrations } from 'stripe-replit-sync';
+import { getStripeSync } from './stripeClient';
+import { WebhookHandlers } from './webhookHandlers';
+import { getDatabaseStatus, ensurePostgresCoreTables, pingPostgres } from './db';
+import { getMongoVaultHealth, pingMongoVault, resolveMongoVaultUri } from "./mongo-vault";
+import { getPublicAppBaseUrl } from "./public-url";
+import { withTimeout } from "./with-timeout";
+
+initServerSentry();
+
+const app = express();
+/** So `express-rate-limit` and logs see the client IP behind Railway / reverse proxies. */
+app.set("trust proxy", 1);
+const httpServer = createServer(app);
+
+declare module "http" {
+  interface IncomingMessage {
+    rawBody: unknown;
+  }
+}
+
+export function log(message: string, source = "express") {
+  const formattedTime = new Date().toLocaleTimeString("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+
+  console.log(`${formattedTime} [${source}] ${message}`);
+}
+
+const STRIPE_INIT_TIMEOUT_MS = 8_000;
+const POSTGRES_BOOT_TIMEOUT_MS = 8_000;
+
+async function healthHandler(_req: Request, res: Response) {
+  const dbStatus = getDatabaseStatus();
+  const mongoVault = getMongoVaultHealth();
+  const checks = {
+    postgres: { configured: dbStatus.configured, reachable: null as boolean | null },
+    mongoVault: {
+      uriConfigured: mongoVault.uriConfigured,
+      connected: mongoVault.connected,
+      reachable: null as boolean | null,
+    },
+  };
+
+  const timeoutMs = 1200;
+  const deadline = new Promise<void>((r) => setTimeout(r, timeoutMs));
+  const work = async () => {
+    const tasks: Promise<void>[] = [];
+    if (dbStatus.configured) {
+      tasks.push(
+        pingPostgres()
+          .then((ok) => {
+            checks.postgres.reachable = ok;
+          })
+          .catch(() => {
+            checks.postgres.reachable = false;
+          }),
+      );
+    }
+    if (mongoVault.uriConfigured) {
+      tasks.push(
+        pingMongoVault()
+          .then(() => {
+            checks.mongoVault.reachable = true;
+          })
+          .catch(() => {
+            checks.mongoVault.reachable = false;
+          }),
+      );
+    }
+    await Promise.all(tasks);
+  };
+  await Promise.race([work(), deadline]);
+
+  res.status(200).json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    database: {
+      configured: dbStatus.configured,
+      ...(dbStatus.message ? { message: dbStatus.message } : {}),
+    },
+    mongoVault: {
+      uriConfigured: mongoVault.uriConfigured,
+      connected: mongoVault.connected,
+      hint:
+        mongoVault.uriConfigured && !mongoVault.connected
+          ? "Mongo URI is set but connection failed — check logs, IP allowlist, and credentials."
+          : !mongoVault.uriConfigured
+            ? "Set MONGO_VAULT_URI or MONGODB_URI (mongodb:// or mongodb+srv://) for Admin vault, CRM, and support in MongoDB."
+            : undefined,
+    },
+    checks,
+  });
+}
+
+// Register /health before any DB or Stripe work so Railway can mark the replica live.
+app.get("/health", healthHandler);
+
+async function initStripe() {
+  const databaseUrl = process.env.DATABASE_URL;
+
+  if (!databaseUrl) {
+    log('DATABASE_URL not found, skipping Stripe initialization', 'stripe');
+    return;
+  }
+
+  try {
+    log('Initializing Stripe schema...', 'stripe');
+    const migrations = runMigrations({
+      databaseUrl
+    }).catch((error: any) => {
+      log(`Stripe schema init failed (non-fatal): ${error?.message || error}`, 'stripe');
+    });
+    const raced = await withTimeout(migrations, STRIPE_INIT_TIMEOUT_MS, () => {
+      log(`Stripe schema init timed out after ${STRIPE_INIT_TIMEOUT_MS}ms (non-fatal); continuing boot`, 'stripe');
+    });
+    if (!raced.timedOut) {
+      log('Stripe schema ready', 'stripe');
+    }
+
+    const stripeSync = await getStripeSync();
+
+    const webhookBaseUrl = getPublicAppBaseUrl();
+    if (!webhookBaseUrl.startsWith("https://")) {
+      log(
+        "Skipping managed Stripe webhook auto-setup (need https). Set PUBLIC_APP_URL=https://your.domain and configure /api/stripe/webhook in Stripe Dashboard for production.",
+        "stripe"
+      );
+    } else {
+      log("Setting up managed webhook...", "stripe");
+      try {
+        const result = await stripeSync.findOrCreateManagedWebhook(
+          `${webhookBaseUrl}/api/stripe/webhook`
+        );
+        if (result?.webhook) {
+          log(`Webhook configured: ${result.webhook.url}`, "stripe");
+        } else {
+          log(
+            "Webhook setup returned no webhook object, continuing without managed webhook",
+            "stripe"
+          );
+        }
+      } catch (webhookError: any) {
+        log(`Webhook setup error (non-fatal): ${webhookError.message}`, "stripe");
+      }
+    }
+
+    log('Syncing Stripe data...', 'stripe');
+    stripeSync.syncBackfill()
+      .then(() => {
+        log('Stripe data synced', 'stripe');
+      })
+      .catch((err: any) => {
+        log(`Error syncing Stripe data: ${err.message}`, 'stripe');
+      });
+  } catch (error: any) {
+    log(`Failed to initialize Stripe: ${error.message}`, 'stripe');
+  }
+}
+
+function listenHttp(): Promise<number> {
+  const port = parseInt(process.env.PORT || "5000", 10);
+  // reusePort is unsupported on Windows (ENOTSUP) and can fail on some PaaS sandboxes.
+  const listenOptions: { port: number; host: string } = {
+    port,
+    host: "0.0.0.0",
+  };
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => reject(err);
+    httpServer.once("error", onError);
+    httpServer.listen(listenOptions, () => {
+      httpServer.off("error", onError);
+      log(`serving on port ${port}`);
+      resolve(port);
+    });
+  });
+}
+
+function logDatastoreStatus() {
+  const d = getDatabaseStatus();
+  if (!d.configured && d.message) {
+    log(d.message, "db");
+  }
+  const mv = getMongoVaultHealth();
+  if (mv.connected) {
+    log("MongoDB vault (videos / CRM / support) is active.", "mongo-vault");
+  } else if (mv.uriConfigured) {
+    log("MongoDB vault URI is set but connection failed — check logs and Atlas IP allowlist.", "mongo-vault");
+  }
+}
+
+(async () => {
+  // Bind PORT immediately so Railway healthchecks do not 404 while Stripe/Postgres hang.
+  await listenHttp();
+  logDatastoreStatus();
+
+  void withTimeout(
+    initStripe().catch((error: any) => {
+      log(`Failed to initialize Stripe: ${error?.message || error}`, "stripe");
+    }),
+    STRIPE_INIT_TIMEOUT_MS + 2_000,
+    () => {
+      log("Stripe initialization still running after timeout; HTTP server stays up", "stripe");
+    },
+  );
+  void withTimeout(
+    ensurePostgresCoreTables().catch((error: any) => {
+      log(`ensurePostgresCoreTables failed (non-fatal): ${error?.message || error}`, "db");
+    }),
+    POSTGRES_BOOT_TIMEOUT_MS,
+    () => {
+      log(`Postgres table ensure timed out after ${POSTGRES_BOOT_TIMEOUT_MS}ms (non-fatal)`, "db");
+    },
+  );
+
+  // Redirect apex domain to www only
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    const host = req.headers.host;
+    if (host === 'equilibrium-trading.xyz') {
+      return res.redirect(301, `https://www.equilibrium-trading.xyz${req.url}`);
+    }
+    next();
+  });
+
+  app.post(
+    '/api/stripe/webhook',
+    express.raw({ type: 'application/json' }),
+    async (req, res) => {
+      const signature = req.headers['stripe-signature'];
+
+      if (!signature) {
+        return res.status(400).json({ error: 'Missing stripe-signature' });
+      }
+
+      try {
+        const sig = Array.isArray(signature) ? signature[0] : signature;
+
+        if (!Buffer.isBuffer(req.body)) {
+          log('STRIPE WEBHOOK ERROR: req.body is not a Buffer', 'stripe');
+          return res.status(500).json({
+            error: 'Webhook processing error',
+            detail: 'req.body is not a raw Buffer',
+          });
+        }
+
+        await WebhookHandlers.processWebhook(req.body as Buffer, sig);
+        res.status(200).json({ received: true });
+      } catch (error: any) {
+        const detail = error instanceof Error ? error.message : String(error);
+        log(`Webhook error: ${detail}`, 'stripe');
+        res.status(400).json({ error: 'Webhook processing error', detail });
+      }
+    }
+  );
+
+  app.use(
+    express.json({
+      verify: (req, _res, buf) => {   
+        req.rawBody = buf;
+      },
+    }),
+  );
+
+  app.use(express.urlencoded({ extended: false }));
+
+  if (process.env.NODE_ENV === "production") {
+    app.use((_req, res, next) => {
+      res.setHeader(
+        "Content-Security-Policy",
+        [
+          "default-src 'self'",
+          "base-uri 'self'",
+          "object-src 'none'",
+          // s3.tradingview.com: embed-widget-advanced-chart.js (TradingView free widget)
+          "script-src 'self' 'unsafe-inline' https://s3.tradingview.com",
+          "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+          "font-src 'self' https://fonts.gstatic.com data:",
+          "img-src 'self' data: https: blob:",
+          "connect-src 'self' https: wss: data:",
+          "media-src 'self' blob: https: data:",
+          "worker-src 'self' blob:",
+          // TradingView: widget iframe + CSP fallback host used by embed (see s.tradingview.com fallback in TV script)
+          "frame-src 'self' https://www.youtube.com https://www.youtube-nocookie.com https://player.vimeo.com https://vimeo.com https://www.tradingview-widget.com https://s.tradingview.com https://www.tradingview.com",
+        ].join("; "),
+      );
+      next();
+    });
+  }
+
+  app.use((req, res, next) => {
+    const start = Date.now();
+    const path = req.path;
+    let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+    const originalResJson = res.json;
+    res.json = function (bodyJson, ...args) {
+      capturedJsonResponse = bodyJson;
+      return originalResJson.apply(res, [bodyJson, ...args]);
+    };
+
+    res.on("finish", () => {
+      const duration = Date.now() - start;
+      if (path.startsWith("/api")) {
+        let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+        if (capturedJsonResponse) {
+          logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+        }
+
+        log(logLine);
+      }
+    });
+
+    next();
+  });
+
+  try {
+    await registerRoutes(httpServer, app);
+  } catch (error: any) {
+    log(`registerRoutes failed (server stays up for /health): ${error?.message || error}`, "express");
+  }
+
+  app.get("/api/system/status", async (_req, res) => {
+    const mv = getMongoVaultHealth();
+    if (!mv.connected) {
+      return res.status(503).json({ database: "disconnected" });
+    }
+    try {
+      await pingMongoVault();
+      return res.json({ database: "connected" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.error("[system/status] Mongo ping failed:", msg);
+      return res.status(503).json({ database: "disconnected", error: "Database ping failed" });
+    }
+  });
+
+  /** Plain-English Mongo diagnostic (visit in browser). */
+  app.get("/api/debug-db", async (_req, res) => {
+    if (!resolveMongoVaultUri()) {
+      return res.status(200).json({
+        status: "Disconnected",
+        detail: "No valid MONGODB_URI (or MONGO_VAULT_URI) in environment",
+      });
+    }
+    const mv = getMongoVaultHealth();
+    if (!mv.connected) {
+      return res.status(200).json({
+        status: "Disconnected",
+        detail: "Handshake failed after startup retries — check Atlas IP allowlist, credentials, and logs",
+      });
+    }
+    try {
+      await pingMongoVault();
+      return res.status(200).json({ status: "Connected" });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return res.status(200).json({ status: "Disconnected", detail: msg });
+    }
+  });
+
+  attachCommandCenterDebugWs(httpServer);
+  attachSupportChatWs(httpServer);
+  heatmapWSManager.initialize(httpServer);
+
+  setupSentryExpressErrorHandler(app);
+
+  // ── Global error handler ──
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+    console.error(`[error] ${status} ${message}`, err.stack || "");
+    res.status(status).json({ message });
+  });
+
+  if (process.env.NODE_ENV === "production") {
+    serveStatic(app);
+  } else {
+    const { setupVite } = await import("./vite");
+    await setupVite(httpServer, app);
+  }
+})().catch((error) => {
+  console.error("[boot] Fatal startup error (process stays alive if already listening):", error);
+});
