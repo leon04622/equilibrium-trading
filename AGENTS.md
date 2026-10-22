@@ -2,14 +2,36 @@
 
 ## Cursor Cloud specific instructions
 
-This repository (`equilibrium-trading`) is currently an empty project scaffold with only a `README.md`. There are no services, dependencies, build systems, or test frameworks configured yet.
+This repository now contains the **Equilibrium Trades** app (Node 20, Express + Vite/React). It is a Hyperliquid trading UI with Stripe billing.
 
-**Current state (as of initial setup):**
-- No application code, package manifests, or dependency files exist.
-- No lint, test, or build commands are available.
-- No services need to be started.
+### Install
 
-**When code is added**, future agents should:
-1. Re-examine the repo for new dependency files (`package.json`, `requirements.txt`, `pyproject.toml`, `Cargo.toml`, `go.mod`, etc.) and install accordingly.
-2. Update the VM environment update script via `SetupVmEnvironment` to reflect new dependency installation commands.
-3. Check for newly added `Makefile`, `docker-compose.yml`, or setup scripts and follow their instructions.
+```bash
+npm ci --no-audit --no-fund
+```
+
+If `npm ci` fails on peer deps, use `npm ci --legacy-peer-deps`.
+
+### Dev server
+
+```bash
+cp -n .env.example .env
+npm run dev
+```
+
+The API + Vite app listen on `PORT` (default **5000**). Postgres (`DATABASE_URL`) is optional; without it the server uses in-memory fallbacks. `GET /health` must return `{ "status": "ok" }`.
+
+### Checks
+
+```bash
+npm run check    # tsc
+npm run test     # vitest
+npm run build    # client + dist/index.cjs
+npm run verify   # typecheck, tests, build, HTTP smoke, Railway boot regression
+```
+
+### Railway
+
+`railway.json` healthchecks `GET /health`. The HTTP server binds `0.0.0.0:$PORT` **before** Stripe schema migrations or Postgres table ensure, so a bad `DATABASE_URL` cannot 404 the replica.
+
+Set on Railway: `DATABASE_URL`, `PUBLIC_APP_URL`, Stripe keys. See `HOSTING.md`.

@@ -1,0 +1,292 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useState,
+  type ReactNode,
+} from "react";
+import { useNavigate } from "react-router-dom";
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Loader2, ArrowDownToLine, AlertCircle, CheckCircle2, XCircle } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { DepositGasNotice } from "@/components/deposit-gas-notice";
+import { useCctpDeposit } from "@/hooks/use-cctp-deposit";
+import { useWallet } from "@/lib/wallet-context";
+import { useTrading } from "@/lib/trading-context";
+
+type DepositSheetContextValue = {
+  openAddToTrading: () => void;
+  openTransfer: () => void;
+};
+
+const DepositSheetCtx = createContext<DepositSheetContextValue | null>(null);
+
+export function useDepositSheet(): DepositSheetContextValue {
+  const v = useContext(DepositSheetCtx);
+  if (!v) {
+    return {
+      openAddToTrading: () => {
+        window.location.href = "/funding?tab=deposit&activate=1";
+      },
+      openTransfer: () => {
+        window.location.href = "/portfolio?transfer=1";
+      },
+    };
+  }
+  return v;
+}
+
+export function DepositSheetProvider({ children }: { children: ReactNode }) {
+  const navigate = useNavigate();
+  const { address, chainId } = useWallet();
+  const { walletUsdcArbitrum, walletEthArbitrum, isLoadingWalletUsdc } = useTrading();
+  const [open, setOpen] = useState(false);
+  const deposit = useCctpDeposit();
+
+  const { prepareDeposit, resetDepositState } = deposit;
+
+  const openAddToTrading = useCallback(() => {
+    if (!address) {
+      navigate("/funding?tab=deposit");
+      return;
+    }
+    resetDepositState();
+    setOpen(true);
+    void prepareDeposit();
+  }, [address, navigate, prepareDeposit, resetDepositState]);
+
+  const openTransfer = useCallback(() => {
+    navigate("/portfolio?transfer=1");
+  }, [navigate]);
+
+  const isOnArbitrum = chainId === 42161;
+  const maxBal = walletUsdcArbitrum ?? 0;
+  const minDeposit = deposit.depositCfg?.minDepositUsdc ?? 5;
+  const statusLine =
+    deposit.depositStep ||
+    (deposit.depositing
+      ? "Working… check Rabby or MetaMask for a signature or transaction prompt."
+      : "");
+  const canSubmitNew =
+    !deposit.depositing &&
+    !isLoadingWalletUsdc &&
+    !!deposit.depositCfg &&
+    deposit.hasArbitrumGasForNewDeposit &&
+    !deposit.hasResumableDeposit &&
+    deposit.depositAmount &&
+    parseFloat(deposit.depositAmount) >= minDeposit &&
+    parseFloat(deposit.depositAmount) <= maxBal + 0.001;
+
+  return (
+    <DepositSheetCtx.Provider value={{ openAddToTrading, openTransfer }}>
+      {children}
+      <Sheet open={open} onOpenChange={setOpen}>
+        <SheetContent side="right" className="w-full sm:max-w-md overflow-y-auto">
+          <SheetHeader>
+            <SheetTitle className="flex items-center gap-2">
+              <ArrowDownToLine className="h-5 w-5 text-primary" />
+              Add to trading
+            </SheetTitle>
+            <SheetDescription>
+              Move USDC from Arbitrum into your trading balance. Each new amount needs one Arbitrum sign + one send —
+              finishing steps after that are automatic and do not repeat when you trade.
+            </SheetDescription>
+          </SheetHeader>
+
+          <div className="mt-6 space-y-4">
+            <div className="rounded-lg border bg-muted/40 p-3 text-sm">
+              <p className="text-muted-foreground">Wallet USDC (Arbitrum)</p>
+              <p className="font-mono text-lg font-semibold">
+                {isLoadingWalletUsdc ? "Loading…" : `${maxBal.toFixed(2)} USDC`}
+              </p>
+            </div>
+
+            {!isOnArbitrum && (
+              <div className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-300">
+                <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+                Switch to Arbitrum One when your wallet prompts you.
+              </div>
+            )}
+
+            {deposit.depositCfgLoadError && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-300">
+                {deposit.depositCfgLoadError}
+              </div>
+            )}
+
+            <DepositGasNotice
+              walletAddress={address}
+              ethBalance={walletEthArbitrum}
+              isLoading={isLoadingWalletUsdc}
+              resumeOnly={false}
+              relayMintEnabled={deposit.depositCfg?.relayMintEnabled}
+            />
+
+            <div className="rounded-lg border border-border/80 bg-muted/30 p-3 text-[11px] text-muted-foreground space-y-1.5">
+              <p className="font-medium text-foreground">What your wallet will ask</p>
+              <p>
+                <strong className="text-foreground">Step 1:</strong> Sign typed data (authorizes USDC — no gas).
+              </p>
+              <p>
+                <strong className="text-foreground">Step 2:</strong> Confirm one transaction on Arbitrum (sends USDC
+                via Circle CCTP).
+              </p>
+              <p>
+                Then we wait for Circle (~1–5 min).{" "}
+                {deposit.depositCfg?.relayMintEnabled
+                  ? "We finish the HyperEVM step for you — no third wallet prompt."
+                  : "You may need one last confirm on HyperEVM (chain 999) unless relay is enabled on the server."}
+              </p>
+            </div>
+
+            {deposit.hasResumableDeposit && !deposit.depositing && (
+              <div className="rounded-lg border border-amber-500/35 bg-amber-500/10 p-3 text-xs text-amber-900 dark:text-amber-100 space-y-2">
+                <p className="font-medium">Previous deposit still finishing</p>
+                <p className="leading-relaxed">
+                  A transfer was already started from this wallet. Choose <strong>Finish pending</strong> to complete
+                  it (no new Arbitrum sign), or <strong>Start fresh</strong> to deposit your current amount as a new
+                  transfer.
+                </p>
+                <div className="flex flex-col gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={deposit.depositing}
+                    onClick={() => void deposit.runDeposit({ resumePending: true })}
+                  >
+                    Finish pending deposit
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void deposit.dismissStuckDeposit()}
+                  >
+                    Start fresh with amount below
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <Label htmlFor="sheet-deposit-amount">Amount (USDC)</Label>
+              <div className="flex gap-2">
+                <Input
+                  id="sheet-deposit-amount"
+                  inputMode="decimal"
+                  value={deposit.depositAmount}
+                  onChange={(e) => deposit.setDepositAmount(e.target.value)}
+                  data-testid="input-sheet-deposit-amount"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    const safe = Math.floor(maxBal * 100) / 100;
+                    deposit.setDepositAmount(safe > 0 ? safe.toFixed(2) : "");
+                  }}
+                >
+                  Max
+                </Button>
+              </div>
+              {deposit.depositCfg && (
+                <p className="text-[11px] text-muted-foreground">
+                  Minimum {deposit.depositCfg.minDepositUsdc} USDC per deposit.
+                </p>
+              )}
+            </div>
+
+            {(deposit.depositing || statusLine) && (
+              <div className="flex items-start gap-2 rounded-lg border border-primary/20 bg-primary/5 p-3 text-xs text-primary">
+                <Loader2
+                  className={cn(
+                    "h-4 w-4 shrink-0 mt-0.5",
+                    (deposit.depositing || deposit.depositAwaitingChain) && "animate-spin",
+                  )}
+                />
+                <span>{statusLine}</span>
+              </div>
+            )}
+
+            {deposit.depositResult && (
+              <div
+                className={cn(
+                  "flex items-start gap-2 rounded-lg border p-3 text-xs",
+                  deposit.depositResult.success
+                    ? "border-bullish/25 bg-bullish/10 text-bullish"
+                    : "border-destructive/30 bg-destructive/10 text-destructive",
+                )}
+              >
+                {deposit.depositResult.success ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0" />
+                ) : (
+                  <XCircle className="h-4 w-4 shrink-0" />
+                )}
+                <span>
+                  {deposit.depositResult.success
+                    ? "Deposit flow finished. Balances update in a few seconds."
+                    : deposit.depositResult.error}
+                </span>
+              </div>
+            )}
+
+            <div className="flex flex-col gap-2">
+              <Button
+                className="w-full"
+                disabled={deposit.depositing || !canSubmitNew}
+                onClick={() => void deposit.runDeposit({ resumePending: false })}
+                data-testid="button-sheet-deposit-confirm"
+              >
+                {deposit.depositing ? (
+                  <>
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                    Processing…
+                  </>
+                ) : (
+                  "Add to trading"
+                )}
+              </Button>
+              {deposit.depositing && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full text-xs"
+                  onClick={() => deposit.cancelDeposit()}
+                  data-testid="button-sheet-deposit-cancel"
+                >
+                  Cancel (safe to close — resume later)
+                </Button>
+              )}
+            </div>
+
+            <p className="text-[10px] text-muted-foreground leading-snug">
+              You do not confirm anything to place normal trades — only when moving USDC from your wallet into
+              Hyperliquid.
+            </p>
+
+            <Button
+              variant="ghost"
+              className="w-full text-xs"
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                navigate("/funding?tab=deposit");
+              }}
+            >
+              Open full funding page
+            </Button>
+          </div>
+        </SheetContent>
+      </Sheet>
+    </DepositSheetCtx.Provider>
+  );
+}
