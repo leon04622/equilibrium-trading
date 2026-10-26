@@ -33,6 +33,12 @@ export interface PatternSignal {
   educationalNote: string;
   whatToWatch: string;
   detectedAt: string;
+  qualityScore?: number;
+  qualityFactors?: { name: string; points: number; note: string }[];
+  lifecycle?: string;
+  lifecycleReason?: string;
+  scanTime?: string;
+  formedAt?: string;
   counterTrend?: boolean;
   volumeConfirmed?: boolean;
   marketBiasLabel?: string;
@@ -83,7 +89,7 @@ const PatternCard = memo(function PatternCard({ signal }: { signal: PatternSigna
       case "developed":
         return <Badge className="bg-blue-500/80 text-white">Developed</Badge>;
       case "breakout_watch":
-        return <Badge className="bg-blue-500/80 text-white">Developed</Badge>;
+        return <Badge className="bg-amber-500/80 text-white">Breakout watch</Badge>;
     }
   };
 
@@ -139,6 +145,14 @@ const PatternCard = memo(function PatternCard({ signal }: { signal: PatternSigna
             {signal.patternName}
           </span>
         </div>
+        {typeof signal.qualityScore === "number" ? (
+          <p className="text-[10px] md:text-xs text-muted-foreground">
+            Quality {signal.qualityScore}/100
+            {signal.lifecycle ? ` · ${signal.lifecycle.replaceAll("_", " ")}` : ""}
+            {signal.formedAt ? ` · formed ${timeSince(signal.formedAt)}` : ""}
+            {signal.scanTime ? ` · scan ${timeSince(signal.scanTime)}` : ""}
+          </p>
+        ) : null}
 
         <div className="grid grid-cols-3 gap-2 md:gap-3 pt-1 border-t">
           <div>
@@ -370,7 +384,7 @@ export function PatternResults({
                 <div className="text-center py-12">
                   <Target className="h-12 w-12 mx-auto text-muted-foreground mb-4" />
                   <p className="text-lg font-medium">Nothing developed</p>
-                  <p className="text-muted-foreground">Developed includes mature setups and confirmed breakouts on this pass.</p>
+                  <p className="text-muted-foreground">Developed is mature geometry. Confirmation still needs a closed candle beyond the boundary.</p>
                 </div>
               ) : (
                 <PatternGrid items={developedSignals} />

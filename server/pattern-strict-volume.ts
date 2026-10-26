@@ -61,35 +61,36 @@ export function detectStrictFlagWithVolume(
       const flagLower = Math.min(...flag.map((c) => parseFloat(c.l)));
       const fr = flagUpper - flagLower;
       let status: DetectedPattern["status"] = "forming";
-      if (isBullish) {
-        const rh = Math.max(...tail.map((c) => parseFloat(c.h)));
-        if (rh > flagUpper * 1.0015) status = "breakout_confirmed";
-        else if (currentPrice > flagUpper) status = "breakout_pending";
-      } else {
-        const rl = Math.min(...tail.map((c) => parseFloat(c.l)));
-        if (rl < flagLower * 0.9985) status = "breakout_confirmed";
-        else if (currentPrice < flagLower) status = "breakout_pending";
-      }
-      const baseConf =
-        status === "breakout_confirmed" ? 68 : status === "breakout_pending" ? 56 : 44;
+      if (isBullish && currentPrice > flagUpper) status = "breakout_pending";
+      if (!isBullish && currentPrice < flagLower) status = "breakout_pending";
+      const baseConf = status === "breakout_pending" ? 56 : 44;
       const confidence = Math.min(94, baseConf + (volumeOk ? 14 : 0));
 
       const pattern: DetectedPattern = {
         name: isBullish ? "bull_flag" : "bear_flag",
         displayName: isBullish ? "Bull Flag" : "Bear Flag",
         status,
-        entryPrice: isBullish
-          ? status === "breakout_confirmed"
-            ? currentPrice
-            : flagUpper
-          : status === "breakout_confirmed"
-            ? currentPrice
-            : flagLower,
+        entryPrice: isBullish ? flagUpper : flagLower,
         stopLoss: isBullish ? flagLower - fr * 0.12 : flagUpper + fr * 0.12,
         takeProfit: isBullish ? flagUpper + poleHeight : flagLower - poleHeight,
         breakoutLevel: isBullish ? flagUpper : flagLower,
         currentPrice,
         confidence,
+        geometry: {
+          source: "strict_flag",
+          poleStartTs: pole[0]!.t,
+          poleEndTs: pole[pole.length - 1]!.t,
+          flagStartTs: flag[0]!.t,
+          flagEndTs: flag[flag.length - 1]!.t,
+          windowStartTs: pole[0]!.t,
+          windowEndTs: tail[tail.length - 1]!.t,
+          formedAtTs: flag[flag.length - 1]!.t,
+          channelUpper: flagUpper,
+          channelLower: flagLower,
+          channelQuality: 1,
+          formationAgeBars: 0,
+          lookaheadOk: true,
+        },
       };
       return { pattern, volumeOk };
     }

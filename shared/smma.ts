@@ -93,8 +93,12 @@ export function classifySmmaTrend(
     slope21 <= 0;
 
   let regime: SmmaTrendRegime = "mixed";
-  if (alignedBull && Math.abs(separationPct) >= 0.04) regime = "bullish";
-  else if (alignedBear && Math.abs(separationPct) >= 0.04) regime = "bearish";
+  const sepOk = Math.abs(separationPct) >= 0.12;
+  const distOk = dist21 == null || Math.abs(dist21) >= 0.35;
+  if (alignedBull && sepOk && distOk) regime = "bullish";
+  else if (alignedBear && sepOk && distOk) regime = "bearish";
+  else if (alignedBull && Math.abs(separationPct) >= 0.04 && distOk && slope200 > 0) regime = "bullish";
+  else if (alignedBear && Math.abs(separationPct) >= 0.04 && distOk && slope200 < 0) regime = "bearish";
 
   return {
     smma21,

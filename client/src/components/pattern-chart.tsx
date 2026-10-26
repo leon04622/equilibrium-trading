@@ -61,7 +61,11 @@ interface EducationalPatternSignal {
   tradeable: boolean;
   maFilterReason: string;
   qualityScore?: number;
+  qualityFactors?: { name: string; points: number; note: string }[];
   lifecycle?: string;
+  lifecycleReason?: string;
+  scanTime?: string;
+  formedAt?: string;
   counterTrend?: boolean;
   volumeConfirmed?: boolean;
   marketBiasLabel?: string;
@@ -1544,6 +1548,7 @@ function PatternChartComponent({
                 <p className="text-[9px] text-[#c5d0e0] mt-0.5">
                   Quality {activeSignal.qualityScore}/100
                   {activeSignal.lifecycle ? ` · ${activeSignal.lifecycle.replaceAll("_", " ")}` : ""}
+                  {activeSignal.formedAt ? ` · formed ${new Date(activeSignal.formedAt).toISOString().slice(0, 16)}Z` : ""}
                 </p>
               )}
             </div>
