@@ -16,6 +16,10 @@ export function normalizeEthAccounts(raw: unknown): string[] {
   return out;
 }
 
+export function mergeEthAccountLists(...groups: Array<string[] | null | undefined>): string[] {
+  return normalizeEthAccounts(groups.flatMap((g) => g ?? []));
+}
+
 type Eip1193Provider = {
   request: (args: { method: string; params?: unknown[] }) => Promise<unknown>;
 };
@@ -25,7 +29,7 @@ async function requestEthAccounts(provider: Eip1193Provider): Promise<string[]> 
   return normalizeEthAccounts(accounts);
 }
 
-async function tryWalletRequestPermissions(provider: Eip1193Provider): Promise<void> {
+export async function tryWalletRequestPermissions(provider: Eip1193Provider): Promise<void> {
   try {
     await provider.request({
       method: "wallet_requestPermissions",
@@ -36,29 +40,65 @@ async function tryWalletRequestPermissions(provider: Eip1193Provider): Promise<v
   }
 }
 
+function collectHexAddresses(value: unknown, into: string[]): void {
+  if (typeof value === "string") {
+    into.push(value);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectHexAddresses(item, into);
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      collectHexAddresses(nested, into);
+    }
+  }
+}
+
+/** Pull every 0x address out of EIP-2255 permission caveats (MetaMask restrictReturnedAccounts). */
+export function accountsFromWalletPermissions(raw: unknown): string[] {
+  const found: string[] = [];
+  collectHexAddresses(raw, found);
+  return normalizeEthAccounts(found);
+}
+
+export async function readAccountsFromPermissions(provider: Eip1193Provider): Promise<string[]> {
+  try {
+    const perms = await provider.request({ method: "wallet_getPermissions" });
+    return accountsFromWalletPermissions(perms);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Request accounts from an injected wallet.
  * Mobile / Rabby: `eth_requestAccounts` first (official Rabby path).
- * Desktop: optional permissions prompt for multi-account pickers.
+ * Desktop Switch account: `wallet_requestPermissions` first so the extension shows every key.
  */
 export async function requestAccountsFromProvider(
   provider: Eip1193Provider,
   options?: { forceAccountPicker?: boolean },
 ): Promise<string[]> {
   const mobile = isMobileUserAgent();
+  const forcePicker = options?.forceAccountPicker === true;
+
+  if (forcePicker && !mobile) {
+    await tryWalletRequestPermissions(provider);
+  }
 
   let list = await requestEthAccounts(provider);
+  const fromPerms = await readAccountsFromPermissions(provider);
+  list = mergeEthAccountLists(list, fromPerms);
   if (list.length > 0) return list;
-
-  if (!mobile && options?.forceAccountPicker) {
-    await tryWalletRequestPermissions(provider);
-    list = await requestEthAccounts(provider);
-    if (list.length > 0) return list;
-  }
 
   if (!mobile) {
     await tryWalletRequestPermissions(provider);
-    list = await requestEthAccounts(provider);
+    list = mergeEthAccountLists(
+      await requestEthAccounts(provider),
+      await readAccountsFromPermissions(provider),
+    );
     if (list.length > 0) return list;
   }
 

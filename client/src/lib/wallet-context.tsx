@@ -11,9 +11,11 @@ import { syncCrmBuilderLinkIfSessionReady } from "@/lib/crm-builder-link-sync";
 import { queryClient } from "@/lib/queryClient";
 import { humanizeWalletConnectError } from "@/lib/wallet-errors";
 import {
+  mergeEthAccountLists,
   readAuthorizedAccounts,
   requestAccountsFromProvider,
 } from "@/lib/wallet-connect-flow";
+import { loadKnownWalletAddresses, rememberWalletAddress } from "@/lib/known-wallets";
 import {
   currentSiteUrlForWalletHandoff,
   detectWalletBrowserKind,
@@ -322,6 +324,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       pendingProviderRef.current = null;
       setConnectError(null);
       setRabbyPasteHandoffActive(false);
+      rememberWalletAddress(normalized);
       console.info(`[Wallet] Connected ${normalized.slice(0, 6)}… via ${walletLabel}`);
     },
     [bindInjectedWalletSession],
@@ -337,6 +340,16 @@ export function WalletProvider({ children }: { children: ReactNode }) {
       }
       setIsConnecting(true);
       try {
+        const want = account.toLowerCase();
+        let live = await readAuthorizedAccounts(raw);
+        if (!live.includes(want)) {
+          live = await requestAccountsFromProvider(raw, { forceAccountPicker: true });
+        }
+        if (!live.includes(want)) {
+          throw new Error(
+            "That address is not the active account in Rabby/MetaMask. Select it in the wallet, approve access, then tap it here again.",
+          );
+        }
         await completeInjectedConnect(
           raw,
           account,
@@ -861,27 +874,41 @@ export function WalletProvider({ children }: { children: ReactNode }) {
 
     try {
       const existing = await readAuthorizedAccounts(selectedProvider);
+      const forceAccountPicker =
+        isMobile && existing.length > 1
+          ? true
+          : isMobile
+            ? Boolean(options?.forceAccountPicker)
+            : (options?.forceAccountPicker ?? true);
       const accounts = await requestAccountsFromProvider(selectedProvider, {
-        forceAccountPicker:
-          isMobile && existing.length > 1
-            ? true
-            : isMobile
-              ? false
-              : (options?.forceAccountPicker ?? true),
+        forceAccountPicker,
       });
 
       if (accounts.length === 0) {
         throw new Error("No accounts returned. Unlock your wallet, pick an account, and try again.");
       }
 
-      if (accounts.length === 1) {
-        await completeInjectedConnect(selectedProvider, accounts[0], walletLabel);
+      const extraFromOtherWallets: string[] = [];
+      for (const wallet of detectedWallets) {
+        if (!wallet.provider?.request || wallet.provider === selectedProvider) continue;
+        extraFromOtherWallets.push(...(await readAuthorizedAccounts(wallet.provider)));
+      }
+
+      const merged = mergeEthAccountLists(
+        accounts,
+        loadKnownWalletAddresses(),
+        address ? [address] : [],
+        extraFromOtherWallets,
+      );
+
+      if (forceAccountPicker || merged.length > 1) {
+        pendingProviderRef.current = selectedProvider;
+        setPendingConnectAccounts(merged);
+        setPendingConnectWalletName(walletLabel);
         return;
       }
 
-      pendingProviderRef.current = selectedProvider;
-      setPendingConnectAccounts(accounts);
-      setPendingConnectWalletName(walletLabel);
+      await completeInjectedConnect(selectedProvider, accounts[0], walletLabel);
     } catch (error: unknown) {
       console.error("Error connecting wallet:", error);
       const message = humanizeWalletConnectError(error);
@@ -890,7 +917,7 @@ export function WalletProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsConnecting(false);
     }
-  }, [isMobile, detectedWallets, completeInjectedConnect, cancelPendingConnect, prepareRabbyPasteHandoff]);
+  }, [isMobile, detectedWallets, completeInjectedConnect, cancelPendingConnect, prepareRabbyPasteHandoff, address]);
 
   const disconnect = useCallback(() => {
     const prev = address;

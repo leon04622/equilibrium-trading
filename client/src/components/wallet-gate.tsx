@@ -39,6 +39,7 @@ export function WalletGate({ children }: { children: React.ReactNode }) {
   const { pathname } = useLocation();
   const {
     isConnected,
+    address,
     isConnecting,
     connect,
     isMobile,
@@ -154,6 +155,7 @@ export function WalletGate({ children }: { children: React.ReactNode }) {
               accounts={pendingConnectAccounts}
               walletName={pendingConnectWalletName}
               isSubmitting={isConnecting}
+              currentAddress={address}
               onSelect={(acc) => void confirmConnectAccount(acc)}
               onCancel={() => cancelPendingConnect()}
             />

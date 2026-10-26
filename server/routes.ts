@@ -87,6 +87,7 @@ import {
 import { SCAN_ALL_TIMEFRAMES } from "@shared/scan-timeframes";
 import { isFortressSovereignAddress } from "./fortress-admin";
 import { isMasterBypassWalletAddress } from "./master-bypass-wallets";
+import { resolveHyperliquidMasterWallet } from "./hl-subaccount-access";
 import {
   tradeJournalCreateBodySchema,
   tradeJournalNotesBodySchema,
@@ -485,6 +486,11 @@ async function buildWalletSubscriptionPayload(walletAddressRaw: string): Promise
   /** Master bypass + legacy admin list — Mongo/Stripe/session cannot downgrade these wallets in the API response. */
   if (isMasterBypassWalletAddress(walletAddress) || isAdminAddress(walletAddress)) {
     return { tier: "mentoring", active: true, expiresAt: null, subTier: "Mentor" };
+  }
+
+  const hlMaster = await resolveHyperliquidMasterWallet(walletAddress);
+  if (hlMaster && hlMaster !== walletAddress) {
+    return buildWalletSubscriptionPayload(hlMaster);
   }
 
   const mongoSnap = await fetchMongoCrmSubscriptionSnapshot(walletAddress);

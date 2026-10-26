@@ -67,8 +67,10 @@ export function WalletConnectSheet({ trigger, onConnect, open: openProp, onOpenC
   const [localError, setLocalError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (isConnected && address) setOpen(false);
-  }, [isConnected, address]);
+    if (isConnected && address && !(pendingConnectAccounts && pendingConnectAccounts.length > 0)) {
+      setOpen(false);
+    }
+  }, [isConnected, address, pendingConnectAccounts]);
 
   const handleConnect = async (walletType?: WalletType) => {
     setLocalError(null);
@@ -160,6 +162,7 @@ export function WalletConnectSheet({ trigger, onConnect, open: openProp, onOpenC
               accounts={pendingConnectAccounts}
               walletName={pendingConnectWalletName}
               isSubmitting={isConnecting}
+              currentAddress={address}
               onSelect={async (acc) => {
                 setLocalError(null);
                 try {
