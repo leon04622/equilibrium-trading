@@ -42,19 +42,30 @@ export function detectHeadAndShoulders(candles: HyperliquidCandle[]): DetectedPa
   if (neckline >= H.price * 0.995) return null;
   const currentPrice = parseFloat(slice[slice.length - 1].c);
   let status: DetectedPattern["status"] = "forming";
-  if (currentPrice < neckline * 0.997) status = "breakout_confirmed";
-  else if (currentPrice < neckline) status = "breakout_pending";
+  if (currentPrice < neckline) status = "breakout_pending";
   const height = H.price - neckline;
   return {
     name: "head_and_shoulders",
     displayName: "Head and Shoulders",
     status,
-    entryPrice: currentPrice,
+    entryPrice: neckline,
     stopLoss: H.price * 1.005,
     takeProfit: neckline - height,
     breakoutLevel: neckline,
     currentPrice,
-    confidence: status === "breakout_confirmed" ? 76 : status === "breakout_pending" ? 62 : 48,
+    confidence: status === "breakout_pending" ? 62 : 48,
+    geometry: {
+      source: "hs",
+      pivotTs: [slice[L.idx]!.t, slice[H.idx]!.t, slice[R.idx]!.t],
+      windowStartTs: slice[0]!.t,
+      windowEndTs: slice[slice.length - 1]!.t,
+      formedAtTs: slice[R.idx]!.t,
+      channelUpper: H.price,
+      channelLower: neckline,
+      channelQuality: 0.75,
+      formationAgeBars: 0,
+      lookaheadOk: true,
+    },
   };
 }
 
@@ -76,18 +87,29 @@ export function detectInverseHeadAndShoulders(candles: HyperliquidCandle[]): Det
   if (neckline <= H.price * 1.005) return null;
   const currentPrice = parseFloat(slice[slice.length - 1].c);
   let status: DetectedPattern["status"] = "forming";
-  if (currentPrice > neckline * 1.003) status = "breakout_confirmed";
-  else if (currentPrice > neckline) status = "breakout_pending";
+  if (currentPrice > neckline) status = "breakout_pending";
   const height = neckline - H.price;
   return {
     name: "inverse_head_and_shoulders",
     displayName: "Inverse Head and Shoulders",
     status,
-    entryPrice: currentPrice,
+    entryPrice: neckline,
     stopLoss: H.price * 0.995,
     takeProfit: neckline + height,
     breakoutLevel: neckline,
     currentPrice,
-    confidence: status === "breakout_confirmed" ? 76 : status === "breakout_pending" ? 62 : 48,
+    confidence: status === "breakout_pending" ? 62 : 48,
+    geometry: {
+      source: "hs",
+      pivotTs: [slice[L.idx]!.t, slice[H.idx]!.t, slice[R.idx]!.t],
+      windowStartTs: slice[0]!.t,
+      windowEndTs: slice[slice.length - 1]!.t,
+      formedAtTs: slice[R.idx]!.t,
+      channelUpper: neckline,
+      channelLower: H.price,
+      channelQuality: 0.75,
+      formationAgeBars: 0,
+      lookaheadOk: true,
+    },
   };
 }

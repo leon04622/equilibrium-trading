@@ -17,6 +17,7 @@ import { runApexGeometricFlagScan, type ApexGeometricResult } from "./ApexDetect
 import { detectHeadAndShoulders, detectInverseHeadAndShoulders } from "./pattern-shoulders";
 import { detectStrictFlagWithVolume } from "./pattern-strict-volume";
 import { enrichDetectedPattern } from "./pattern-enrichment";
+import { collapseDuplicateFlagRows } from "./pattern-geometry";
 import { normalizeOhlcv } from "@shared/ohlcv-normalize";
 import { classifySmmaTrend } from "@shared/smma";
 import { wilderAtr } from "@shared/atr";
@@ -171,8 +172,9 @@ export function gatherMultiPatternCandidates(
     volumeOk: row.volumeOk,
   }));
 
+  const live = enriched.filter((row) => row.p.lifecycle !== "expired" && row.p.lifecycle !== "invalidated");
   const rows = applyBeginnerOpposingFilters(
-    enriched.sort((a, b) => scoreCandidate(b.p, b.volumeOk) - scoreCandidate(a.p, a.volumeOk)),
+    collapseDuplicateFlagRows(live).sort((a, b) => scoreCandidate(b.p, b.volumeOk) - scoreCandidate(a.p, a.volumeOk)),
   );
 
   let apexForUi = apexResult;

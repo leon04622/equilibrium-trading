@@ -24,7 +24,11 @@ import {
   detectCrossover,
   getPatternStructuralBias,
   type DetectedPattern,
+  type QualityFactor,
+  type PatternGeometryDebug,
 } from "./sma-detection";
+import { classifySmmaTrend } from "@shared/smma";
+import { wilderAtr } from "@shared/atr";
 import { type ApexGeometricResult } from "./ApexDetectionEngine";
 import { gatherMultiPatternCandidates } from "./MultiPatternEngine";
 import { findPivotHighsLows } from "./pattern-shoulders";
@@ -105,7 +109,12 @@ export interface EducationalPatternSignal {
   tradeable: boolean;
   maFilterReason: string;
   qualityScore?: number;
+  qualityFactors?: QualityFactor[];
   lifecycle?: string;
+  lifecycleReason?: string;
+  scanTime?: string;
+  formedAt?: string;
+  geometry?: PatternGeometryDebug;
   /** Pattern structure opposes SMMA + swing-defined market bias */
   counterTrend?: boolean;
   /** Strict flag: volume softer in flag vs pole */
@@ -127,29 +136,32 @@ export function inferMarketBias(candles: HyperliquidCandle[]): { bias: MarketBia
   const hh = highs.slice(-4);
   const ll = lows.slice(-4);
   const parts: string[] = [];
+  let risingHighs = false;
+  let fallingHighs = false;
+  let risingLows = false;
+  let fallingLows = false;
   if (hh.length >= 2) {
-    parts.push(
-      hh[hh.length - 1].price >= hh[0].price * 1.0002
-        ? "Swing highs rising (HH)."
-        : hh[hh.length - 1].price <= hh[0].price * 0.9998
-          ? "Swing highs falling (LH)."
-          : "Swing highs mixed.",
-    );
+    risingHighs = hh[hh.length - 1].price >= hh[0].price * 1.0002;
+    fallingHighs = hh[hh.length - 1].price <= hh[0].price * 0.9998;
+    parts.push(risingHighs ? "Swing highs rising (HH)." : fallingHighs ? "Swing highs falling (LH)." : "Swing highs mixed.");
   }
   if (ll.length >= 2) {
-    parts.push(
-      ll[ll.length - 1].price >= ll[0].price * 1.0002
-        ? "Swing lows rising (HL)."
-        : ll[ll.length - 1].price <= ll[0].price * 0.9998
-          ? "Swing lows falling (LL)."
-          : "Swing lows mixed.",
-    );
+    risingLows = ll[ll.length - 1].price >= ll[0].price * 1.0002;
+    fallingLows = ll[ll.length - 1].price <= ll[0].price * 0.9998;
+    parts.push(risingLows ? "Swing lows rising (HL)." : fallingLows ? "Swing lows falling (LL)." : "Swing lows mixed.");
   }
+  const mixedSwings = (risingHighs && fallingLows) || (fallingHighs && risingLows);
+  const atr = wilderAtr(candles);
+  const closes = candles.map((c) => parseFloat(c.c)).filter(Number.isFinite);
+  const ctx = classifySmmaTrend(closes, atr);
   let bias: MarketBias;
-  if (sma.sma21 > sma.sma200 * 1.00015) bias = "bullish";
-  else if (sma.sma21 < sma.sma200 * 0.99985) bias = "bearish";
-  else bias = "neutral_choppy";
-  const sm = `21 SMMA ${sma.sma21 > sma.sma200 ? "above" : sma.sma21 < sma.sma200 ? "below" : "near"} 200 SMMA (trend-first).`;
+  if (mixedSwings || !ctx || ctx.regime === "mixed") bias = "neutral_choppy";
+  else if (ctx.regime === "bullish") bias = "bullish";
+  else bias = "bearish";
+  const sm = ctx
+    ? `21 SMMA ${ctx.smma21 > ctx.smma200 ? "above" : ctx.smma21 < ctx.smma200 ? "below" : "near"} 200 SMMA (${ctx.regime}; sep ${ctx.separationPct.toFixed(3)}%).`
+    : `21 SMMA ${sma.sma21 > sma.sma200 ? "above" : sma.sma21 < sma.sma200 ? "below" : "near"} 200 SMMA (trend-first).`;
+  if (mixedSwings) parts.push("Mixed swing structure — treat SMMA distance as borderline.");
   return { bias, label: [sm, ...parts].join(" ") };
 }
 
@@ -225,8 +237,8 @@ function buildDynamicEducation(
     (patternStatus === "forming"
       ? "Pattern still forming — wait for boundary respect and a decisive close beyond the trigger."
       : patternStatus === "breakout_watch"
-        ? "Structure mature — prioritize a breakout that expands range with rising volume."
-        : "Developed — monitor failed breaks; invalidation is a return deep inside the pattern.");
+        ? "Wick or probe only — Developed/Watch is not confirmation until a candle closes beyond the boundary."
+        : "Developed geometry is live on the chart. Confirmation still requires a qualifying closed candle beyond the boundary.");
 
   return { educationalNote: base.trim(), whatToWatch: watch.trim() };
 }
@@ -247,6 +259,7 @@ function buildEducationalSignalFromCandidate(
   marketBiasLabel: string,
   apexResult: ApexGeometricResult,
   idSalt: number,
+  scanNowMs: number = Date.now(),
 ): EducationalPatternSignal {
   const best = row;
   const structural = getPatternStructuralBias(best.p);
@@ -255,9 +268,9 @@ function buildEducationalSignalFromCandidate(
     (marketBias === "bearish" && structural === "bullish");
 
   const patternStatus: EducationalPatternSignal["patternStatus"] =
-    best.p.status === "breakout_confirmed"
+    best.p.lifecycle === "confirmed" || best.p.status === "breakout_confirmed"
       ? "developed"
-      : best.p.status === "breakout_pending"
+      : best.p.lifecycle === "breakout_pending" || best.p.status === "breakout_pending"
         ? "breakout_watch"
         : "forming";
 
@@ -294,7 +307,10 @@ function buildEducationalSignalFromCandidate(
   }
 
   const smaRelationship = `${marketBiasLabel} Pattern: ${best.p.displayName}.`;
-  const sameApex = !!(apexResult.pattern && best.p.name === apexResult.pattern.name);
+  const sameApex = !!(
+    apexResult.pattern &&
+    (best.p.geometry?.source === "apex_flag" || best.p.displayName.includes("Apex"))
+  );
 
   let apexTier: EducationalPatternSignal["apexTier"] = apexResult.pattern ? "standard" : "no_pattern_apex";
   if (sameApex && apexResult.pattern) {
@@ -328,14 +344,19 @@ function buildEducationalSignalFromCandidate(
     patternName,
     patternStatus,
     qualityScore: best.p.qualityScore,
+    qualityFactors: best.p.qualityFactors,
     lifecycle: best.p.lifecycle,
+    lifecycleReason: best.p.lifecycleReason,
+    scanTime: new Date(scanNowMs).toISOString(),
+    formedAt: best.p.geometry?.formedAtTs ? new Date(best.p.geometry.formedAtTs).toISOString() : undefined,
+    geometry: best.p.geometry,
     sma21: s21,
     sma200: s200,
     currentPrice: price,
     smaRelationship: apexPrefix + smaRelationship,
     educationalNote: apexNoteForRow ? `${apexPrefix}${apexNoteForRow} ${educationalNote}` : educationalNote,
     whatToWatch,
-    detectedAt: new Date(),
+    detectedAt: new Date(scanNowMs),
     tradeable,
     maFilterReason,
     counterTrend,
@@ -387,6 +408,7 @@ export async function analyzeEducationalUniversal(
   coin: string,
   timeframe: string,
   candles: HyperliquidCandle[],
+  options?: { nowMs?: number },
 ): Promise<EducationalPatternSignal[]> {
   // Must match `scanOneCoinMtf` gate. Shorter TFs only fetch up to 320 bars
   // (`patternScanCandleLimitForInterval`); requiring 400 here zeroed all fast-TF signals.
@@ -400,7 +422,7 @@ export async function analyzeEducationalUniversal(
   const crossover = detectCrossover(currentSMA, prevSma);
 
   // Opposing-direction pattern pairs are deduped inside (per coin × timeframe — every TF in MTF scans).
-  const { rows, apexResult } = gatherMultiPatternCandidates(candles, timeframe);
+  const { rows, apexResult } = gatherMultiPatternCandidates(candles, timeframe, { nowMs: options?.nowMs });
 
   if (rows.length === 0) {
     if (!crossover) return [];
@@ -448,6 +470,7 @@ export async function analyzeEducationalUniversal(
     ];
   }
 
+  const scanNowMs = options?.nowMs ?? Date.now();
   return rows.map((row, i) =>
     buildEducationalSignalFromCandidate(
       coin,
@@ -458,6 +481,7 @@ export async function analyzeEducationalUniversal(
       marketBiasLabel,
       apexResult,
       i,
+      scanNowMs,
     ),
   );
 }

@@ -5,7 +5,6 @@
 import type { HyperliquidCandle } from "./hyperliquid";
 import {
   calculateSMAFromCandles,
-  getThresholds,
   type DetectedPattern,
 } from "./sma-detection";
 
@@ -153,7 +152,6 @@ function buildBullFlag(
   tail: HyperliquidCandle[],
   timeframe: string,
 ): DetectedPattern | null {
-  const thresholds = getThresholds(timeframe);
   const { poleTop, poleBottom, H } = poleRange(pole);
   if (H <= 0) return null;
   const flagHi = Math.max(...flag.map(cHigh));
@@ -161,14 +159,12 @@ function buildBullFlag(
   const flagRange = flagHi - flagLo;
   const currentPrice = cClose(tail[tail.length - 1]);
   let status: DetectedPattern["status"] = "forming";
-  const recentHigh = Math.max(...tail.map(cHigh));
-  const breakoutPct = ((recentHigh - flagHi) / Math.max(flagHi, 1e-12)) * 100;
-  if (breakoutPct > thresholds.minBreakoutPercent) status = "breakout_confirmed";
-  else if (currentPrice > flagHi) status = "breakout_pending";
+  if (currentPrice > flagHi) status = "breakout_pending";
 
-  const entryPrice = status === "breakout_confirmed" ? currentPrice : flagHi;
+  const entryPrice = flagHi;
   let takeProfit = flagHi + H;
   if (takeProfit <= entryPrice) takeProfit = entryPrice + H;
+  const inside = flag.filter((c) => cHigh(c) <= flagHi * 1.001 && cLow(c) >= flagLo * 0.999).length;
 
   return {
     name: "bull_flag",
@@ -179,7 +175,24 @@ function buildBullFlag(
     takeProfit,
     breakoutLevel: flagHi,
     currentPrice,
-    confidence: status === "breakout_confirmed" ? 86 : status === "breakout_pending" ? 72 : 48,
+    confidence: status === "breakout_pending" ? 72 : 48,
+    geometry: {
+      source: "apex_flag",
+      poleStartTs: pole[0]!.t,
+      poleEndTs: pole[pole.length - 1]!.t,
+      flagStartTs: flag[0]!.t,
+      flagEndTs: flag[flag.length - 1]!.t,
+      windowStartTs: pole[0]!.t,
+      windowEndTs: tail[tail.length - 1]!.t,
+      formedAtTs: flag[flag.length - 1]!.t,
+      channelUpper: flagHi,
+      channelLower: flagLo,
+      poleTop,
+      poleBottom,
+      channelQuality: inside / Math.max(flag.length, 1),
+      formationAgeBars: 0,
+      lookaheadOk: true,
+    },
   };
 }
 
@@ -189,7 +202,6 @@ function buildBearFlag(
   tail: HyperliquidCandle[],
   timeframe: string,
 ): DetectedPattern | null {
-  const thresholds = getThresholds(timeframe);
   const { poleTop, poleBottom, H } = poleRange(pole);
   if (H <= 0) return null;
   const flagHi = Math.max(...flag.map(cHigh));
@@ -197,14 +209,12 @@ function buildBearFlag(
   const flagRange = flagHi - flagLo;
   const currentPrice = cClose(tail[tail.length - 1]);
   let status: DetectedPattern["status"] = "forming";
-  const recentLow = Math.min(...tail.map(cLow));
-  const breakoutPct = ((flagLo - recentLow) / Math.max(flagLo, 1e-12)) * 100;
-  if (breakoutPct > thresholds.minBreakoutPercent) status = "breakout_confirmed";
-  else if (currentPrice < flagLo) status = "breakout_pending";
+  if (currentPrice < flagLo) status = "breakout_pending";
 
-  const entryPrice = status === "breakout_confirmed" ? currentPrice : flagLo;
+  const entryPrice = flagLo;
   let takeProfit = flagLo - H;
   if (takeProfit >= entryPrice) takeProfit = entryPrice - H;
+  const inside = flag.filter((c) => cHigh(c) <= flagHi * 1.001 && cLow(c) >= flagLo * 0.999).length;
 
   return {
     name: "bear_flag",
@@ -215,7 +225,24 @@ function buildBearFlag(
     takeProfit,
     breakoutLevel: flagLo,
     currentPrice,
-    confidence: status === "breakout_confirmed" ? 86 : status === "breakout_pending" ? 72 : 48,
+    confidence: status === "breakout_pending" ? 72 : 48,
+    geometry: {
+      source: "apex_flag",
+      poleStartTs: pole[0]!.t,
+      poleEndTs: pole[pole.length - 1]!.t,
+      flagStartTs: flag[0]!.t,
+      flagEndTs: flag[flag.length - 1]!.t,
+      windowStartTs: pole[0]!.t,
+      windowEndTs: tail[tail.length - 1]!.t,
+      formedAtTs: flag[flag.length - 1]!.t,
+      channelUpper: flagHi,
+      channelLower: flagLo,
+      poleTop,
+      poleBottom,
+      channelQuality: inside / Math.max(flag.length, 1),
+      formationAgeBars: 0,
+      lookaheadOk: true,
+    },
   };
 }
 

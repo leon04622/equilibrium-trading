@@ -36,6 +36,26 @@ export type PatternLifecycle =
 
 export type QualityFactor = { name: string; points: number; note: string };
 
+export type PatternGeometryDebug = {
+  source: "sma_flag" | "apex_flag" | "triangle" | "double" | "wedge" | "hs" | "strict_flag";
+  poleStartTs?: number;
+  poleEndTs?: number;
+  flagStartTs?: number;
+  flagEndTs?: number;
+  pivotTs?: number[];
+  windowStartTs: number;
+  windowEndTs: number;
+  formedAtTs: number;
+  channelUpper?: number;
+  channelLower?: number;
+  poleTop?: number;
+  poleBottom?: number;
+  channelQuality: number;
+  formationAgeBars: number;
+  invalidation?: string;
+  lookaheadOk: boolean;
+};
+
 export type PatternName = 
   | "bull_flag" | "bear_flag" 
   | "bullish_pennant" | "bearish_pennant"
@@ -63,6 +83,7 @@ export interface DetectedPattern {
   tradeEligible?: boolean;
   tradeEligibilityReason?: string;
   smmaRegime?: string;
+  geometry?: PatternGeometryDebug;
 }
 
 export interface CrossoverSignal {
@@ -294,19 +315,19 @@ function detectFlagPatternInFixedWindow(
     const flagSlopePct = ((lastFlagClose - firstFlagClose) / firstFlagClose) * 100;
     if (flagSlopePct > bullFlagMaxUpSlope) return null;
 
-    // ── BREAKOUT: current price vs flag upper boundary ────────────────────────
+    // Wick tests stay pending. Closed-candle confirmation is applied later.
     let status: DetectedPattern["status"] = "forming";
-    const recentHigh = Math.max(...recentCandles.map(c => parseFloat(c.h)));
-    const breakoutPct = ((recentHigh - flagUpperBound) / flagUpperBound) * 100;
-    if (breakoutPct > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice > flagUpperBound) {
-      status = "breakout_pending";
-    }
+    if (currentPrice > flagUpperBound) status = "breakout_pending";
 
-    const entryPrice = status === "breakout_confirmed" ? currentPrice : flagUpperBound;
+    const entryPrice = flagUpperBound;
     let takeProfit = flagUpperBound + poleHeight;
     if (takeProfit <= entryPrice) takeProfit = entryPrice + poleHeight;
+
+    const inside = flagCandles.filter((c) => {
+      const h = parseFloat(c.h);
+      const l = parseFloat(c.l);
+      return h <= flagUpperBound * 1.001 && l >= flagLowerBound * 0.999;
+    }).length;
 
     return {
       name: "bull_flag",
@@ -317,7 +338,24 @@ function detectFlagPatternInFixedWindow(
       takeProfit,
       breakoutLevel: flagUpperBound,
       currentPrice,
-      confidence: status === "breakout_confirmed" ? 80 : status === "breakout_pending" ? 65 : 44,
+      confidence: status === "breakout_pending" ? 65 : 44,
+      geometry: {
+        source: "sma_flag",
+        poleStartTs: poleCandles[0]!.t,
+        poleEndTs: poleCandles[poleCandles.length - 1]!.t,
+        flagStartTs: flagCandles[0]!.t,
+        flagEndTs: flagCandles[flagCandles.length - 1]!.t,
+        windowStartTs: window[0]!.t,
+        windowEndTs: window[window.length - 1]!.t,
+        formedAtTs: flagCandles[flagCandles.length - 1]!.t,
+        channelUpper: flagUpperBound,
+        channelLower: flagLowerBound,
+        poleTop,
+        poleBottom,
+        channelQuality: inside / Math.max(flagCandles.length, 1),
+        formationAgeBars: 0,
+        lookaheadOk: true,
+      },
     };
 
   } else {
@@ -356,19 +394,18 @@ function detectFlagPatternInFixedWindow(
     const flagSlopePct = ((lastFlagClose - firstFlagClose) / firstFlagClose) * 100;
     if (flagSlopePct < bearFlagMinSlope) return null;
 
-    // ── BREAKOUT: current price vs flag lower boundary ────────────────────────
     let status: DetectedPattern["status"] = "forming";
-    const recentLow = Math.min(...recentCandles.map(c => parseFloat(c.l)));
-    const breakoutPct = ((flagLowerBound - recentLow) / flagLowerBound) * 100;
-    if (breakoutPct > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice < flagLowerBound) {
-      status = "breakout_pending";
-    }
+    if (currentPrice < flagLowerBound) status = "breakout_pending";
 
-    const entryPrice = status === "breakout_confirmed" ? currentPrice : flagLowerBound;
+    const entryPrice = flagLowerBound;
     let takeProfit = flagLowerBound - poleHeight;
     if (takeProfit >= entryPrice) takeProfit = entryPrice - poleHeight;
+
+    const inside = flagCandles.filter((c) => {
+      const h = parseFloat(c.h);
+      const l = parseFloat(c.l);
+      return h <= flagUpperBound * 1.001 && l >= flagLowerBound * 0.999;
+    }).length;
 
     return {
       name: "bear_flag",
@@ -379,7 +416,24 @@ function detectFlagPatternInFixedWindow(
       takeProfit,
       breakoutLevel: flagLowerBound,
       currentPrice,
-      confidence: status === "breakout_confirmed" ? 80 : status === "breakout_pending" ? 65 : 44,
+      confidence: status === "breakout_pending" ? 65 : 44,
+      geometry: {
+        source: "sma_flag",
+        poleStartTs: poleCandles[0]!.t,
+        poleEndTs: poleCandles[poleCandles.length - 1]!.t,
+        flagStartTs: flagCandles[0]!.t,
+        flagEndTs: flagCandles[flagCandles.length - 1]!.t,
+        windowStartTs: window[0]!.t,
+        windowEndTs: window[window.length - 1]!.t,
+        formedAtTs: flagCandles[flagCandles.length - 1]!.t,
+        channelUpper: flagUpperBound,
+        channelLower: flagLowerBound,
+        poleTop,
+        poleBottom,
+        channelQuality: inside / Math.max(flagCandles.length, 1),
+        formationAgeBars: 0,
+        lookaheadOk: true,
+      },
     };
   }
 }
@@ -499,29 +553,15 @@ function detectTrianglePatternInWindow(
 
   if (isBullish && (patternName === "ascending_triangle" || patternName === "symmetrical_triangle")) {
     breakoutLevel = resistance;
-    // Use recent 5-candle high to catch a confirmed breakout that closed above
-    const recentHigh = Math.max(...recentCandles.slice(-5).map(c => parseFloat(c.h)));
-    const breakoutPercent = ((recentHigh - resistance) / resistance) * 100;
-    if (breakoutPercent > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice > resistance) {
-      status = "breakout_pending";
-    }
-    entryPrice = status === "breakout_confirmed" ? currentPrice : breakoutLevel;
+    if (currentPrice > resistance) status = "breakout_pending";
+    entryPrice = breakoutLevel;
     stopLoss = support - (range * 0.1);
     takeProfit = resistance + range;
     if (takeProfit <= entryPrice) takeProfit = entryPrice + range;
   } else if (!isBullish && (patternName === "descending_triangle" || patternName === "symmetrical_triangle")) {
     breakoutLevel = support;
-    // Use recent 5-candle low to catch a confirmed breakdown that closed below
-    const recentLow = Math.min(...recentCandles.slice(-5).map(c => parseFloat(c.l)));
-    const breakdownPercent = ((support - recentLow) / support) * 100;
-    if (breakdownPercent > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice < support) {
-      status = "breakout_pending";
-    }
-    entryPrice = status === "breakout_confirmed" ? currentPrice : breakoutLevel;
+    if (currentPrice < support) status = "breakout_pending";
+    entryPrice = breakoutLevel;
     stopLoss = resistance + (range * 0.1);
     takeProfit = support - range;
     if (takeProfit >= entryPrice) takeProfit = entryPrice - range;
@@ -529,6 +569,8 @@ function detectTrianglePatternInWindow(
     return null;
   }
 
+  const lastHigh = recentHighs[recentHighs.length - 1]!;
+  const lastLow = recentLows[recentLows.length - 1]!;
   return {
     name: patternName,
     displayName,
@@ -538,7 +580,24 @@ function detectTrianglePatternInWindow(
     takeProfit,
     breakoutLevel,
     currentPrice,
-    confidence: status === "breakout_confirmed" ? 75 : status === "breakout_pending" ? 60 : 48,
+    confidence: status === "breakout_pending" ? 60 : 48,
+    geometry: {
+      source: "triangle",
+      pivotTs: [
+        recentCandles[recentHighs[0]!.idx]?.t,
+        recentCandles[lastHigh.idx]?.t,
+        recentCandles[recentLows[0]!.idx]?.t,
+        recentCandles[lastLow.idx]?.t,
+      ].filter((t): t is number => typeof t === "number"),
+      windowStartTs: recentCandles[0]!.t,
+      windowEndTs: recentCandles[recentCandles.length - 1]!.t,
+      formedAtTs: recentCandles[Math.max(lastHigh.idx, lastLow.idx)]!.t,
+      channelUpper: resistance,
+      channelLower: support,
+      channelQuality: range > 0 ? Math.max(0, 1 - Math.abs(highSlopePct) - Math.abs(lowSlopePct) * 8) : 0,
+      formationAgeBars: 0,
+      lookaheadOk: true,
+    },
   };
 }
 
@@ -610,14 +669,9 @@ function detectDoublePatternInWindow(
         if (currentPrice < neckline * 0.95) continue; // Price already ran too far down — old pattern
 
         let status: DetectedPattern["status"] = "forming";
-        const breakoutPercent = ((neckline - currentPrice) / neckline) * 100;
-        if (breakoutPercent > thresholds.minBreakoutPercent) {
-          status = "breakout_confirmed";
-        } else if (currentPrice < neckline) {
-          status = "breakout_pending";
-        }
+        if (currentPrice < neckline) status = "breakout_pending";
 
-        const entryPrice = status === "breakout_confirmed" ? currentPrice : neckline;
+        const entryPrice = neckline;
         let takeProfit = neckline - patternHeight;
         if (takeProfit >= entryPrice) takeProfit = entryPrice - patternHeight;
 
@@ -630,7 +684,19 @@ function detectDoublePatternInWindow(
           takeProfit,
           breakoutLevel: neckline,
           currentPrice,
-          confidence: status === "breakout_confirmed" ? 75 : status === "breakout_pending" ? 62 : 48,
+          confidence: status === "breakout_pending" ? 62 : 48,
+          geometry: {
+            source: "double",
+            pivotTs: [recentCandles[h1.idx]!.t, recentCandles[h2.idx]!.t],
+            windowStartTs: recentCandles[0]!.t,
+            windowEndTs: recentCandles[recentCandles.length - 1]!.t,
+            formedAtTs: recentCandles[h2.idx]!.t,
+            channelUpper: avgHigh,
+            channelLower: neckline,
+            channelQuality: Math.max(0, 1 - priceDiffPct / 2),
+            formationAgeBars: 0,
+            lookaheadOk: true,
+          },
         };
       }
     }
@@ -668,14 +734,9 @@ function detectDoublePatternInWindow(
         if (currentPrice > neckline * 1.05) continue; // Already ran too far up — old pattern
 
         let status: DetectedPattern["status"] = "forming";
-        const breakoutPercent = ((currentPrice - neckline) / neckline) * 100;
-        if (breakoutPercent > thresholds.minBreakoutPercent) {
-          status = "breakout_confirmed";
-        } else if (currentPrice > neckline) {
-          status = "breakout_pending";
-        }
+        if (currentPrice > neckline) status = "breakout_pending";
 
-        const entryPrice = status === "breakout_confirmed" ? currentPrice : neckline;
+        const entryPrice = neckline;
         let takeProfit = neckline + patternHeight;
         if (takeProfit <= entryPrice) takeProfit = entryPrice + patternHeight;
 
@@ -688,7 +749,19 @@ function detectDoublePatternInWindow(
           takeProfit,
           breakoutLevel: neckline,
           currentPrice,
-          confidence: status === "breakout_confirmed" ? 75 : status === "breakout_pending" ? 62 : 48,
+          confidence: status === "breakout_pending" ? 62 : 48,
+          geometry: {
+            source: "double",
+            pivotTs: [recentCandles[l1.idx]!.t, recentCandles[l2.idx]!.t],
+            windowStartTs: recentCandles[0]!.t,
+            windowEndTs: recentCandles[recentCandles.length - 1]!.t,
+            formedAtTs: recentCandles[l2.idx]!.t,
+            channelUpper: neckline,
+            channelLower: avgLow,
+            channelQuality: Math.max(0, 1 - priceDiffPct / 2),
+            formationAgeBars: 0,
+            lookaheadOk: true,
+          },
         };
       }
     }
@@ -714,7 +787,6 @@ function detectWedgePatternInWindow(
 ): DetectedPattern | null {
   if (recentCandles.length < 40) return null;
 
-  const thresholds = getThresholds(timeframe);
   const avgPrice = parseFloat(recentCandles[recentCandles.length - 1].c);
   const { highs, lows } = findSwingPoints(recentCandles, 3);
 
@@ -760,15 +832,9 @@ function detectWedgePatternInWindow(
     if (lowSlope - highSlope < minSlopeMag) return null;
 
     let status: DetectedPattern["status"] = "forming";
-    const recentLow = Math.min(...recentCandles.slice(-5).map(c => parseFloat(c.l)));
-    const breakdownPct = ((support - recentLow) / support) * 100;
-    if (breakdownPct > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice < support) {
-      status = "breakout_pending";
-    }
+    if (currentPrice < support) status = "breakout_pending";
 
-    const entryPrice = status === "breakout_confirmed" ? currentPrice : support;
+    const entryPrice = support;
     let takeProfit = support - range;
     if (takeProfit >= entryPrice) takeProfit = entryPrice - range;
 
@@ -781,7 +847,24 @@ function detectWedgePatternInWindow(
       takeProfit,
       breakoutLevel: support,
       currentPrice,
-      confidence: status === "breakout_confirmed" ? 70 : status === "breakout_pending" ? 55 : 42,
+      confidence: status === "breakout_pending" ? 55 : 42,
+      geometry: {
+        source: "wedge",
+        pivotTs: [
+          recentCandles[recentHighs[0]!.idx]?.t,
+          recentCandles[recentHighs[recentHighs.length - 1]!.idx]?.t,
+          recentCandles[recentLows[0]!.idx]?.t,
+          recentCandles[recentLows[recentLows.length - 1]!.idx]?.t,
+        ].filter((t): t is number => typeof t === "number"),
+        windowStartTs: recentCandles[0]!.t,
+        windowEndTs: recentCandles[recentCandles.length - 1]!.t,
+        formedAtTs: recentCandles[recentCandles.length - 1]!.t,
+        channelUpper: resistance,
+        channelLower: support,
+        channelQuality: 0.7,
+        formationAgeBars: 0,
+        lookaheadOk: true,
+      },
     };
   }
 
@@ -798,15 +881,9 @@ function detectWedgePatternInWindow(
     if (lowSlope - highSlope < minSlopeMag) return null;
 
     let status: DetectedPattern["status"] = "forming";
-    const recentHigh = Math.max(...recentCandles.slice(-5).map(c => parseFloat(c.h)));
-    const breakoutPct = ((recentHigh - resistance) / resistance) * 100;
-    if (breakoutPct > thresholds.minBreakoutPercent) {
-      status = "breakout_confirmed";
-    } else if (currentPrice > resistance) {
-      status = "breakout_pending";
-    }
+    if (currentPrice > resistance) status = "breakout_pending";
 
-    const entryPrice = status === "breakout_confirmed" ? currentPrice : resistance;
+    const entryPrice = resistance;
     let takeProfit = resistance + range;
     if (takeProfit <= entryPrice) takeProfit = entryPrice + range;
 
@@ -819,7 +896,24 @@ function detectWedgePatternInWindow(
       takeProfit,
       breakoutLevel: resistance,
       currentPrice,
-      confidence: status === "breakout_confirmed" ? 70 : status === "breakout_pending" ? 55 : 42,
+      confidence: status === "breakout_pending" ? 55 : 42,
+      geometry: {
+        source: "wedge",
+        pivotTs: [
+          recentCandles[recentHighs[0]!.idx]?.t,
+          recentCandles[recentHighs[recentHighs.length - 1]!.idx]?.t,
+          recentCandles[recentLows[0]!.idx]?.t,
+          recentCandles[recentLows[recentLows.length - 1]!.idx]?.t,
+        ].filter((t): t is number => typeof t === "number"),
+        windowStartTs: recentCandles[0]!.t,
+        windowEndTs: recentCandles[recentCandles.length - 1]!.t,
+        formedAtTs: recentCandles[recentCandles.length - 1]!.t,
+        channelUpper: resistance,
+        channelLower: support,
+        channelQuality: 0.7,
+        formationAgeBars: 0,
+        lookaheadOk: true,
+      },
     };
   }
 

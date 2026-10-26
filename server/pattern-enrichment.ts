@@ -8,6 +8,7 @@ import {
 import { classifySmmaTrend, type SmmaTrendRegime } from "@shared/smma";
 import { wilderAtr } from "@shared/atr";
 import { lastClosedBarIndex } from "@shared/ohlcv-normalize";
+import { stampPatternGeometry } from "./pattern-geometry";
 
 export type { PatternLifecycle, QualityFactor };
 
@@ -140,8 +141,24 @@ export function scorePatternQuality(
     factors.push({ name: "closed_breakout", points: 16, note: "Closed-candle confirmation." });
   } else if (pattern.lifecycle === "breakout_pending" || pattern.status === "breakout_pending") {
     factors.push({ name: "boundary_test", points: 8, note: "Boundary test without closed confirmation." });
+  } else if (pattern.lifecycle === "expired" || pattern.lifecycle === "invalidated") {
+    factors.push({ name: "expired", points: -20, note: pattern.lifecycleReason || "Pattern expired." });
   } else {
     factors.push({ name: "developing", points: 3, note: "Structure only." });
+  }
+
+  const age = pattern.geometry?.formationAgeBars ?? 0;
+  if (age > 12) {
+    factors.push({ name: "formation_age", points: -6, note: `Structure completed ${age} bars ago.` });
+  } else if (pattern.geometry?.formedAtTs) {
+    factors.push({ name: "formation_age", points: 2, note: "Formation is still current on this timeframe." });
+  }
+  if (pattern.geometry && pattern.geometry.channelQuality < 0.7) {
+    factors.push({
+      name: "channel_quality",
+      points: -4,
+      note: `Channel respect ${(pattern.geometry.channelQuality * 100).toFixed(0)}%.`,
+    });
   }
 
   factors.push(
@@ -182,10 +199,11 @@ export function enrichDetectedPattern(
   extras: { volumeOk: boolean; mtfAligned?: boolean; dataGaps?: number; nowMs?: number },
 ): DetectedPattern {
   const confirmed = applyClosedCandleConfirmation(pattern, candles, interval, extras.nowMs);
+  const stamped = stampPatternGeometry(confirmed, candles, interval, extras.nowMs ?? Date.now());
   const closes = candles.map((c) => num(c.c)).filter(Number.isFinite);
   const atr = wilderAtr(candles);
-  const elig = smmaTradeEligible(confirmed, closes, atr);
-  const { qualityScore, qualityFactors } = scorePatternQuality(confirmed, {
+  const elig = smmaTradeEligible(stamped, closes, atr);
+  const { qualityScore, qualityFactors } = scorePatternQuality(stamped, {
     volumeOk: extras.volumeOk,
     tradeEligible: elig.eligible,
     atr,
@@ -193,7 +211,7 @@ export function enrichDetectedPattern(
     mtfAligned: extras.mtfAligned,
   });
   return {
-    ...confirmed,
+    ...stamped,
     tradeEligible: elig.eligible,
     tradeEligibilityReason: elig.reason,
     smmaRegime: elig.regime,

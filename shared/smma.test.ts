@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lastSmma, smmaSeries, smmaStep } from "./smma";
+import { classifySmmaTrend, lastSmma, smmaSeries, smmaStep } from "./smma";
 
 describe("SMMA / RMA", () => {
   it("seeds with SMA of the first N values then recurses", () => {
@@ -22,5 +22,14 @@ describe("SMMA / RMA", () => {
 
   it("returns nulls when history is shorter than period", () => {
     expect(lastSmma([1, 2, 3], 5)).toBeNull();
+  });
+
+  it("classifies borderline SMMA distance as mixed even if 21 is slightly below 200", () => {
+    const values: number[] = [];
+    for (let i = 0; i < 220; i++) values.push(100 + i * 0.01);
+    for (let i = 0; i < 8; i++) values.push(values[values.length - 1]! - 0.02);
+    const ctx = classifySmmaTrend(values, 2);
+    expect(ctx).not.toBeNull();
+    expect(ctx!.regime).toBe("mixed");
   });
 });
