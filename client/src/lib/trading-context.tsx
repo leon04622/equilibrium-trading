@@ -1,0 +1,1245 @@
+import { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from "react";
+import { useWallet } from "./wallet-context";
+import {
+  getAccountState,
+  getOpenOrders,
+  getClearinghouseStateViaInfoClient,
+  getSpotState,
+  closePosition as hlClosePosition,
+  cancelOrder as hlCancelOrder,
+  placeTriggerOrder,
+  placeTrailingStopMarketOrder,
+  syncOrderToExchange,
+  type AccountState,
+} from "./hyperliquid-client";
+import {
+  convertRawFrontendOrdersToHl,
+  mapClearinghouseAssetPositionsToDashboard,
+  applyMarginSummaryFromAccountState,
+} from "./hl-account-map";
+import {
+  isVenueTpslCandidate,
+  orderKindForTpsl,
+  selectTpSlOrders,
+} from "./chart-tpsl-from-orders";
+import { snapOrderPrice } from "./trailing-stop-orchestrator";
+import {
+  verifyVenueTpslResting,
+  waitForClearinghousePosition,
+  waitedPositionToPosition,
+} from "./tpsl-venue-verify";
+import { getArbitrumEthBalance } from "./arbitrum-gas";
+import { getArbitrumUsdcBalances } from "./arbitrum-usdc";
+import { queryClient } from "./queryClient";
+import { SubscriptionClient, WebSocketTransport } from "@nktkas/hyperliquid";
+
+export interface Position {
+  id: string;
+  coin: string;
+  side: "long" | "short";
+  size: number;
+  entryPrice: number;
+  markPrice: number;
+  leverage: number;
+  margin: number;
+  unrealizedPnl: number;
+  unrealizedPnlPercent: number;
+  liquidationPrice: number;
+  openedAt: Date;
+}
+
+export interface TradeRecord {
+  id: string;
+  coin: string;
+  side: "buy" | "sell";
+  size: number;
+  price: number;
+  pnl?: number;
+  fee: number;
+  timestamp: Date;
+}
+
+export interface Indicator {
+  id: string;
+  name: string;
+  type: "overlay" | "oscillator";
+  enabled: boolean;
+  settings: Record<string, number | string | boolean>;
+  color: string;
+}
+
+export interface PlaceTpslOptions {
+  /**
+   * Opt-in only. Default SL is a **fixed** reduce-only trigger at `slPrice` (reliable at your set price).
+   * Native venue trailing stops trail from favorable price moves and do not behave like a fixed stop.
+   */
+  useNativeTrailingSl?: boolean;
+  /** Required when `useNativeTrailingSl` is true — callback vs mark (e.g. 0.02 = 2%). */
+  slTrailingCallbackRate?: number;
+}
+
+export interface HLOpenOrder {
+  coin: string;
+  oid: number;
+  side: string;
+  sz: string;
+  limitPx: string;
+  timestamp: number;
+  origSz: string;
+  orderType?: "limit" | "stop_loss" | "take_profit";
+  triggerPx?: string;
+  /** From HL `frontendOpenOrders` / WS when present — chart TP/SL mapping. */
+  isTrigger?: boolean;
+  reduceOnly?: boolean;
+  /** Venue `tpsl` field when present — authoritative for SL vs TP. */
+  hlTpsl?: "tp" | "sl";
+}
+
+interface TradingContextType {
+  connected: boolean;
+  address: string;
+  balance: number;
+  withdrawable: number;
+  accountValue: number;
+  /** Native USDC total on spot (from `spotClearinghouseState`). */
+  spotUsdcTotal: number;
+  /** USDC on spot available to use (total − hold). */
+  spotUsdcAvailable: number;
+  /** Perp account value + spot USDC total (unified HL equity). */
+  unifiedAccountUsd: number;
+  /** Native USDC on Arbitrum in the connected wallet (Revolut / external sends). */
+  walletUsdcArbitrum: number;
+  /** Legacy USDC.e on Arbitrum (shown in totals; swap to native before CCTP deposit). */
+  walletUsdcBridged: number;
+  /** Native + bridged USDC in the connected wallet. */
+  walletUsdcTotal: number;
+  /** Native ETH on Arbitrum in the connected wallet (pays CCTP burn gas). */
+  walletEthArbitrum: number;
+  /** Trading + wallet USDC — what users see as "total balance". */
+  displayTotalUsd: number;
+  isLoadingWalletUsdc: boolean;
+  /** False until the first wallet USDC fetch finishes (success or failure). */
+  walletUsdcReady: boolean;
+  refreshWalletUsdc: (options?: { silent?: boolean }) => Promise<{
+    native: number;
+    bridged: number;
+    eth: number;
+  }>;
+  marginUsed: number;
+  positions: Position[];
+  openOrders: HLOpenOrder[];
+  /** Last `frontendOpenOrders` JSON from the venue info API. */
+  hlFrontendOpenOrdersRaw: unknown;
+  /** Unix ms when open orders + positions were last refreshed from HL (null = never / disconnected). */
+  hlAccountSyncAt: number | null;
+  /** Last refresh error message (debug). */
+  hlAccountFetchError: string | null;
+  tradeHistory: TradeRecord[];
+  indicators: Indicator[];
+  currentPrices: Record<string, number>;
+  isPriceReady: (coin: string) => boolean;
+  isLoadingAccount: boolean;
+  isClosingPosition: boolean;
+  connect: (address?: string) => void;
+  disconnect: () => void;
+  closePosition: (positionId: string) => Promise<{ success: boolean; error?: string }>;
+  cancelHLOrder: (coin: string, oid: number) => Promise<{ success: boolean; error?: string }>;
+  placeTPSL: (
+    coin: string,
+    size: number,
+    isLong: boolean,
+    tpPrice?: number,
+    slPrice?: number,
+    entryPriceOverride?: number,
+    options?: PlaceTpslOptions,
+  ) => Promise<{ success: boolean; error?: string }>;
+  setIndicators: (indicators: Indicator[]) => void;
+  updatePrices: (prices: Record<string, number>) => void;
+  refreshAccount: (options?: { silent?: boolean }) => Promise<void>;
+}
+
+const defaultIndicators: Indicator[] = [
+  {
+    id: "sma21",
+    name: "SMA 21",
+    type: "overlay",
+    enabled: true,
+    settings: { period: 21 },
+    color: "#3b82f6",
+  },
+  {
+    id: "sma200",
+    name: "SMA 200",
+    type: "overlay",
+    enabled: true,
+    settings: { period: 200 },
+    color: "#f59e0b",
+  },
+  {
+    id: "ema9",
+    name: "EMA 9",
+    type: "overlay",
+    enabled: false,
+    settings: { period: 9 },
+    color: "#8b5cf6",
+  },
+  {
+    id: "rsi",
+    name: "RSI",
+    type: "oscillator",
+    enabled: false,
+    settings: { period: 14, overbought: 70, oversold: 30 },
+    color: "#ec4899",
+  },
+  {
+    id: "macd",
+    name: "MACD",
+    type: "oscillator",
+    enabled: false,
+    settings: { fast: 12, slow: 26, signal: 9 },
+    color: "#06b6d4",
+  },
+  {
+    id: "bb",
+    name: "Bollinger Bands",
+    type: "overlay",
+    enabled: false,
+    settings: { period: 20, stdDev: 2 },
+    color: "#10b981",
+  },
+  {
+    id: "vwap",
+    name: "VWAP",
+    type: "overlay",
+    enabled: false,
+    settings: {},
+    color: "#f43f5e",
+  },
+];
+
+const TradingContext = createContext<TradingContextType | undefined>(undefined);
+
+// LocalStorage keys
+const STORAGE_KEYS = {
+  connected: "equilibrium_connected",
+  address: "equilibrium_address",
+  balance: "equilibrium_balance",
+  positions: "equilibrium_positions",
+  tradeHistory: "equilibrium_trade_history",
+  indicators: "equilibrium_indicators",
+};
+
+/** Coalesce venue WS account + order snapshots for UI (perps overview / equity strip). */
+const HL_ACCOUNT_UI_THROTTLE_MS = 3000;
+
+// Load from localStorage with default fallback
+function loadFromStorage<T>(key: string, defaultValue: T): T {
+  try {
+    const stored = localStorage.getItem(key);
+    if (!stored) return defaultValue;
+    const parsed = JSON.parse(stored);
+    // Handle date conversion for positions and trades
+    if (Array.isArray(parsed)) {
+      return parsed.map((item: any) => ({
+        ...item,
+        openedAt: item.openedAt ? new Date(item.openedAt) : undefined,
+        createdAt: item.createdAt ? new Date(item.createdAt) : undefined,
+        filledAt: item.filledAt ? new Date(item.filledAt) : undefined,
+        timestamp: item.timestamp ? new Date(item.timestamp) : undefined,
+      })) as T;
+    }
+    return parsed;
+  } catch {
+    return defaultValue;
+  }
+}
+
+function saveToStorage<T>(key: string, value: T): void {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+export function TradingProvider({ children }: { children: ReactNode }) {
+  const { address: walletAddress, isConnected: walletConnected, signer, hyperliquidSessionReady } = useWallet();
+  
+  const [balance, setBalance] = useState(0);
+  const [withdrawable, setWithdrawable] = useState(0);
+  const [accountValue, setAccountValue] = useState(0);
+  const [spotUsdcTotal, setSpotUsdcTotal] = useState(0);
+  const [spotUsdcAvailable, setSpotUsdcAvailable] = useState(0);
+  const [walletUsdcArbitrum, setWalletUsdcArbitrum] = useState(0);
+  const [walletUsdcBridged, setWalletUsdcBridged] = useState(0);
+  const [walletEthArbitrum, setWalletEthArbitrum] = useState(0);
+  const [walletUsdcReady, setWalletUsdcReady] = useState(false);
+  const walletUsdcFetchGenRef = useRef(0);
+  const refreshAccountGenRef = useRef(0);
+  const [marginUsed, setMarginUsed] = useState(0);
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [openOrders, setOpenOrders] = useState<HLOpenOrder[]>([]);
+  const [hlFrontendOpenOrdersRaw, setHlFrontendOpenOrdersRaw] = useState<unknown>(null);
+  const [hlAccountSyncAt, setHlAccountSyncAt] = useState<number | null>(null);
+  const [hlAccountFetchError, setHlAccountFetchError] = useState<string | null>(null);
+  const [tradeHistory, setTradeHistory] = useState<TradeRecord[]>(() => loadFromStorage(STORAGE_KEYS.tradeHistory, []));
+  const [indicators, setIndicatorsState] = useState<Indicator[]>(() => loadFromStorage(STORAGE_KEYS.indicators, defaultIndicators));
+  const [currentPrices, setCurrentPrices] = useState<Record<string, number>>({});
+  const [isLoadingAccount, setIsLoadingAccount] = useState(false);
+  const [isClosingPosition, setIsClosingPosition] = useState(false);
+  const isPlacingTPSLRef = useRef(false);
+  /** Latest mids for mark display — avoids tying refreshAccount to currentPrices identity (prevents interval churn). */
+  const currentPricesRef = useRef<Record<string, number>>({});
+  const wsSubsRef = useRef<Array<{ unsubscribe: () => Promise<void> }>>([]);
+  const userEventsRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastHlBalanceSnapRef = useRef<string>("");
+  const spotUsdcRef = useRef(0);
+  useEffect(() => {
+    spotUsdcRef.current = spotUsdcTotal;
+  }, [spotUsdcTotal]);
+
+  const connected = walletConnected;
+  const address = walletAddress || "";
+  /** Perp + HL spot — derived so WS perp updates stay in sync with headline totals. */
+  const unifiedAccountUsd = accountValue + spotUsdcTotal;
+  const walletUsdcTotal = walletUsdcArbitrum + walletUsdcBridged;
+  const displayTotalUsd = unifiedAccountUsd + walletUsdcTotal;
+
+  const refreshWalletUsdc = useCallback(async (options?: { silent?: boolean }): Promise<{
+    native: number;
+    bridged: number;
+    eth: number;
+  }> => {
+    if (!walletAddress) {
+      setWalletUsdcArbitrum(0);
+      setWalletUsdcBridged(0);
+      setWalletEthArbitrum(0);
+      setWalletUsdcReady(false);
+      return { native: 0, bridged: 0, eth: 0 };
+    }
+    const gen = ++walletUsdcFetchGenRef.current;
+    try {
+      const [{ native, bridged }, eth] = await Promise.all([
+        getArbitrumUsdcBalances(walletAddress),
+        getArbitrumEthBalance(walletAddress),
+      ]);
+      if (walletUsdcFetchGenRef.current === gen) {
+        setWalletUsdcArbitrum(native);
+        setWalletUsdcBridged(bridged);
+        setWalletEthArbitrum(eth);
+      }
+      return { native, bridged, eth };
+    } catch (e) {
+      console.warn("[wallet-usdc] balance refresh failed:", e);
+      return { native: 0, bridged: 0, eth: 0 };
+    } finally {
+      if (walletUsdcFetchGenRef.current === gen) {
+        setWalletUsdcReady(true);
+      }
+    }
+  }, [walletAddress]);
+
+  useEffect(() => {
+    if (!walletAddress) {
+      setWalletUsdcArbitrum(0);
+      setWalletUsdcBridged(0);
+      setWalletEthArbitrum(0);
+      setWalletUsdcReady(false);
+      return;
+    }
+    setWalletUsdcReady(false);
+    void refreshWalletUsdc();
+    const id = setInterval(() => void refreshWalletUsdc({ silent: true }), 20_000);
+    return () => clearInterval(id);
+  }, [walletAddress, refreshWalletUsdc]);
+
+  useEffect(() => {
+    const onDepositDone = () => void refreshWalletUsdc({ silent: true });
+    window.addEventListener("equilibrium-deposit-confirmed", onDepositDone);
+    return () => window.removeEventListener("equilibrium-deposit-confirmed", onDepositDone);
+  }, [refreshWalletUsdc]);
+
+  // Persist state changes to localStorage
+  useEffect(() => { saveToStorage(STORAGE_KEYS.tradeHistory, tradeHistory); }, [tradeHistory]);
+  useEffect(() => { saveToStorage(STORAGE_KEYS.indicators, indicators); }, [indicators]);
+  useEffect(() => {
+    currentPricesRef.current = currentPrices;
+  }, [currentPrices]);
+
+  // Fetch account data from the venue when wallet connects
+  const refreshAccount = useCallback(async (options?: { silent?: boolean }) => {
+    if (!walletAddress) return;
+
+    const gen = ++refreshAccountGenRef.current;
+    const silent = options?.silent ?? false;
+    if (!silent) setIsLoadingAccount(true);
+    setHlAccountFetchError(null);
+    try {
+      const [accountState, hlOrders, spotState] = await Promise.all([
+        getClearinghouseStateViaInfoClient(walletAddress).then(
+          (s) => s ?? getAccountState(walletAddress),
+        ),
+        getOpenOrders(walletAddress),
+        getSpotState(walletAddress),
+      ]);
+
+      if (refreshAccountGenRef.current !== gen) return;
+
+      let spotUsdc = 0;
+      let spotUsdcAvail = 0;
+      const usdcRow = spotState?.balances?.find((b) => b.coin === "USDC");
+      if (usdcRow) {
+        const total = parseFloat(usdcRow.total || "0") || 0;
+        const hold = parseFloat(usdcRow.hold || "0") || 0;
+        spotUsdc = total;
+        spotUsdcAvail = Math.max(0, total - hold);
+      }
+      setSpotUsdcTotal(spotUsdc);
+      setSpotUsdcAvailable(spotUsdcAvail);
+
+      if (accountState) {
+        applyMarginSummaryFromAccountState(accountState, {
+          setAccountValue,
+          setMarginUsed,
+          setBalance,
+          setWithdrawable,
+        });
+      }
+
+      const perpForSnap = accountState
+        ? parseFloat(accountState.marginSummary?.accountValue || "0") || 0
+        : 0;
+      const unifiedSnap = perpForSnap + spotUsdc;
+      const snapKey = `${perpForSnap.toFixed(4)}|${spotUsdc.toFixed(4)}`;
+      if (lastHlBalanceSnapRef.current !== snapKey) {
+        lastHlBalanceSnapRef.current = snapKey;
+        void fetch("/api/user/hl-balance-snapshot", {
+          method: "POST",
+          credentials: "include",
+          headers: {
+            "Content-Type": "application/json",
+            "x-wallet-address": walletAddress,
+            Authorization: `Bearer ${walletAddress}`,
+          },
+          body: JSON.stringify({
+            perpAccountValue: perpForSnap,
+            spotUsdc: spotUsdc,
+            totalUsd: unifiedSnap,
+          }),
+        })
+          .then(() => {
+            if (refreshAccountGenRef.current === gen) {
+              void queryClient.invalidateQueries({ queryKey: ["/api/user/sync", walletAddress] });
+            }
+          })
+          .catch(() => {});
+      }
+
+      if (refreshAccountGenRef.current !== gen) return;
+
+      const mids = currentPricesRef.current;
+      const hlRows = mapClearinghouseAssetPositionsToDashboard(accountState?.assetPositions, mids);
+      const convertedPositions: Position[] = hlRows.map((pos, idx) => ({
+        id: `hl-${pos.coin}-${idx}`,
+        coin: pos.coin,
+        side: pos.side,
+        size: pos.size,
+        entryPrice: pos.entryPrice,
+        markPrice: pos.markPrice,
+        leverage: pos.leverage,
+        margin: pos.margin,
+        unrealizedPnl: pos.unrealizedPnl,
+        unrealizedPnlPercent: pos.unrealizedPnlPercent,
+        liquidationPrice: pos.liquidationPrice,
+        openedAt: new Date(),
+      }));
+      setPositions(convertedPositions);
+      console.log("[positions] fetched from API:", convertedPositions.map(p => ({ coin: p.coin, side: p.side, size: p.size, entryPrice: p.entryPrice, pnl: p.unrealizedPnl })));
+
+      const triggerOrds = (hlOrders || []).filter((o: any) => o.isTrigger || o.triggerPx);
+      if (triggerOrds.length > 0) {
+        console.log("[openOrders] trigger orders raw:", JSON.stringify(triggerOrds.map((o: any) => ({
+          coin: o.coin, orderType: o.orderType, triggerCondition: o.triggerCondition, tpsl: o.tpsl,
+          triggerPx: o.triggerPx, limitPx: o.limitPx, isTrigger: o.isTrigger,
+        }))));
+      }
+      const convertedOrders = convertRawFrontendOrdersToHl(hlOrders || []);
+      setOpenOrders(convertedOrders);
+      setHlFrontendOpenOrdersRaw(
+        Array.isArray(hlOrders) ? hlOrders.map((o: unknown) => (typeof o === "object" && o !== null ? { ...(o as object) } : o)) : [],
+      );
+      setHlAccountSyncAt(Date.now());
+      setHlAccountFetchError(null);
+
+    } catch (error) {
+      if (refreshAccountGenRef.current !== gen) return;
+      console.error("Error fetching exchange account:", error);
+      setHlAccountFetchError(error instanceof Error ? error.message : String(error));
+    } finally {
+      if (refreshAccountGenRef.current === gen && !silent) setIsLoadingAccount(false);
+    }
+  }, [walletAddress]);
+
+  // After a successful Arbitrum deposit, refresh HL balances (Trading + any consumer of useTrading).
+  useEffect(() => {
+    if (!walletConnected || !walletAddress) return;
+    const onDepositConfirmed = () => {
+      void refreshAccount({ silent: true });
+      void refreshWalletUsdc({ silent: true });
+    };
+    window.addEventListener("equilibrium-deposit-confirmed", onDepositConfirmed);
+    return () => window.removeEventListener("equilibrium-deposit-confirmed", onDepositConfirmed);
+  }, [walletConnected, walletAddress, refreshAccount]);
+
+  // Refresh account when wallet connects
+  useEffect(() => {
+    if (walletConnected && walletAddress) {
+      refreshAccount();
+    } else {
+      setPositions([]);
+      setOpenOrders([]);
+      setHlFrontendOpenOrdersRaw(null);
+      setHlAccountSyncAt(null);
+      setHlAccountFetchError(null);
+      setBalance(0);
+      setWithdrawable(0);
+      setAccountValue(0);
+      setSpotUsdcTotal(0);
+      setMarginUsed(0);
+      lastHlBalanceSnapRef.current = "";
+    }
+  }, [walletConnected, walletAddress]);
+
+  // WebSocket: open orders + clearinghouse state — UI updates throttled to reduce main-thread churn (chart/scanner).
+  useEffect(() => {
+    if (!walletConnected || !walletAddress) return;
+    let cancelled = false;
+    let openUiTimer: ReturnType<typeof setTimeout> | null = null;
+    let chUiTimer: ReturnType<typeof setTimeout> | null = null;
+
+    (async () => {
+      try {
+        const transport = new WebSocketTransport();
+        const subClient = new SubscriptionClient({ transport });
+        const user = walletAddress as `0x${string}`;
+        const subs: Array<{ unsubscribe: () => Promise<void> }> = [];
+
+        let lastOpenUi = 0;
+        let pendingOpenRaw: unknown[] | null = null;
+
+        const flushOpenOrders = () => {
+          openUiTimer = null;
+          if (cancelled || pendingOpenRaw === null) return;
+          const raw = pendingOpenRaw;
+          pendingOpenRaw = null;
+          setOpenOrders(convertRawFrontendOrdersToHl(raw));
+          setHlFrontendOpenOrdersRaw(
+            Array.isArray(raw)
+              ? raw.map((o: unknown) =>
+                  typeof o === "object" && o !== null ? { ...(o as object) } : o,
+                )
+              : [],
+          );
+          setHlAccountSyncAt(Date.now());
+          lastOpenUi = Date.now();
+        };
+
+        const sOpen = await subClient.openOrders({ user }, (evt) => {
+          if (cancelled) return;
+          const raw = (evt.orders ?? []) as unknown[];
+          pendingOpenRaw = raw;
+          const now = Date.now();
+          if (now - lastOpenUi >= HL_ACCOUNT_UI_THROTTLE_MS) {
+            flushOpenOrders();
+            return;
+          }
+          if (!openUiTimer) {
+            openUiTimer = setTimeout(flushOpenOrders, HL_ACCOUNT_UI_THROTTLE_MS - (now - lastOpenUi));
+          }
+        });
+        subs.push(sOpen);
+
+        let lastChUi = 0;
+        let pendingCh: AccountState | null = null;
+
+        const flushClearinghouse = () => {
+          chUiTimer = null;
+          if (cancelled || !pendingCh) return;
+          const ch = pendingCh;
+          pendingCh = null;
+          applyMarginSummaryFromAccountState(ch, {
+            setAccountValue,
+            setMarginUsed,
+            setBalance,
+            setWithdrawable,
+          });
+          const mids = currentPricesRef.current;
+          const hlRows = mapClearinghouseAssetPositionsToDashboard(ch?.assetPositions, mids);
+          setPositions(
+            hlRows.map((pos, idx) => ({
+              id: `hl-${pos.coin}-${idx}`,
+              coin: pos.coin,
+              side: pos.side,
+              size: pos.size,
+              entryPrice: pos.entryPrice,
+              markPrice: pos.markPrice,
+              leverage: pos.leverage,
+              margin: pos.margin,
+              unrealizedPnl: pos.unrealizedPnl,
+              unrealizedPnlPercent: pos.unrealizedPnlPercent,
+              liquidationPrice: pos.liquidationPrice,
+              openedAt: new Date(),
+            })),
+          );
+          setHlAccountSyncAt(Date.now());
+          lastChUi = Date.now();
+        };
+
+        const sCh = await subClient.clearinghouseState({ user }, (evt) => {
+          if (cancelled) return;
+          pendingCh = evt.clearinghouseState as unknown as AccountState;
+          const now = Date.now();
+          if (now - lastChUi >= HL_ACCOUNT_UI_THROTTLE_MS) {
+            flushClearinghouse();
+            return;
+          }
+          if (!chUiTimer) {
+            chUiTimer = setTimeout(flushClearinghouse, HL_ACCOUNT_UI_THROTTLE_MS - (now - lastChUi));
+          }
+        });
+        subs.push(sCh);
+
+        const sUe = await subClient.userEvents({ user }, () => {
+          if (cancelled) return;
+          if (userEventsRefreshTimerRef.current) clearTimeout(userEventsRefreshTimerRef.current);
+          userEventsRefreshTimerRef.current = setTimeout(() => {
+            userEventsRefreshTimerRef.current = null;
+            void refreshAccount();
+          }, 500);
+        });
+        subs.push(sUe);
+
+        wsSubsRef.current = subs;
+      } catch (e) {
+        console.warn("[HL] WebSocket subscription failed:", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (openUiTimer) clearTimeout(openUiTimer);
+      if (chUiTimer) clearTimeout(chUiTimer);
+      if (userEventsRefreshTimerRef.current) {
+        clearTimeout(userEventsRefreshTimerRef.current);
+        userEventsRefreshTimerRef.current = null;
+      }
+      const subs = wsSubsRef.current;
+      wsSubsRef.current = [];
+      for (const s of subs) {
+        void s.unsubscribe().catch(() => {});
+      }
+    };
+  }, [walletConnected, walletAddress, refreshAccount]);
+
+  // Slower REST fallback if WS misses an edge; visibility refocus still triggers immediate refresh.
+  useEffect(() => {
+    if (!walletConnected || !walletAddress) return;
+
+    const interval = setInterval(refreshAccount, 10_000);
+
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshAccount();
+    };
+    const onFocus = () => refreshAccount();
+
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [walletConnected, walletAddress, refreshAccount]);
+
+  // Connection is now handled by wallet context
+  const connect = useCallback(() => {
+    // Wallet connection is handled by WalletContext
+    // This is kept for backward compatibility
+  }, []);
+
+  const disconnect = useCallback(() => {
+    // Wallet disconnection is handled by WalletContext
+    setPositions([]);
+    setOpenOrders([]);
+    setHlFrontendOpenOrdersRaw(null);
+    setHlAccountSyncAt(null);
+    setHlAccountFetchError(null);
+  }, []);
+
+  const closePosition = useCallback(async (positionId: string): Promise<{ success: boolean; error?: string }> => {
+    const position = positions.find(p => p.id === positionId);
+    if (!position) {
+      return { success: false, error: "Position not found" };
+    }
+    
+    if (!signer) {
+      return { success: false, error: "Wallet not connected" };
+    }
+    
+    setIsClosingPosition(true);
+    try {
+      // Close position on the exchange by placing opposite market order with reduceOnly
+      const result = await hlClosePosition(
+        signer,
+        position.coin,
+        position.size,
+        position.side === "long"
+      );
+      
+      if (!result.success) {
+        return { success: false, error: result.error || "Failed to close position" };
+      }
+      
+      // Record the trade
+      const exitPrice = result.avgPrice || position.markPrice;
+      const realizedPnl = position.unrealizedPnl;
+      const fee = position.size * position.markPrice * 0.001;
+      
+      const tradeRecord: TradeRecord = {
+        id: `trade-${Date.now()}`,
+        coin: position.coin,
+        side: position.side === "long" ? "sell" : "buy",
+        size: position.size,
+        price: exitPrice,
+        pnl: realizedPnl,
+        fee: fee,
+        timestamp: new Date(),
+      };
+      setTradeHistory(th => [tradeRecord, ...th]);
+      
+      // Auto-grade the trade (use real TP/SL trigger orders when present)
+      try {
+        const walletAddress = await signer.getAddress();
+        const entry = position.entryPrice;
+        const isLong = position.side === "long";
+
+        const classify = (o: HLOpenOrder): "tp" | "sl" | "other" => {
+          const ot = (o.orderType || "").toLowerCase();
+          if (ot.includes("take profit") || ot === "take_profit") return "tp";
+          if (ot.includes("stop") || ot === "stop_loss") return "sl";
+          const trigPx = o.triggerPx ? parseFloat(o.triggerPx) : parseFloat(o.limitPx);
+          if (!trigPx || isNaN(trigPx)) return "other";
+          return isLong ? (trigPx > entry ? "tp" : "sl") : (trigPx < entry ? "tp" : "sl");
+        };
+
+        const coinOrders = openOrders.filter(o => o.coin === position.coin && o.triggerPx);
+        const tpPx = coinOrders.find(o => classify(o) === "tp");
+        const slPx = coinOrders.find(o => classify(o) === "sl");
+        const tpFromOrder = tpPx ? parseFloat(tpPx.triggerPx || tpPx.limitPx) : NaN;
+        const slFromOrder = slPx ? parseFloat(slPx.triggerPx || slPx.limitPx) : NaN;
+
+        const slDistance = entry * 0.02;
+        const tpDistance = entry * 0.04;
+        const estimatedSL = isLong ? entry - slDistance : entry + slDistance;
+        const estimatedTP = isLong ? entry + tpDistance : entry - tpDistance;
+
+        const stopLoss =
+          slFromOrder > 0 && !isNaN(slFromOrder) ? slFromOrder : Math.max(estimatedSL, 1e-8);
+        const takeProfit =
+          tpFromOrder > 0 && !isNaN(tpFromOrder) ? tpFromOrder : Math.max(estimatedTP, 1e-8);
+
+        await fetch("/api/journal/grade", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            walletAddress,
+            coin: position.coin,
+            side: position.side,
+            entryPrice: entry,
+            exitPrice,
+            stopLoss,
+            takeProfit,
+            leverage: position.leverage,
+            size: position.size,
+            patternType: "SMMA 21/200 trend",
+            timeframe: "multi",
+          }),
+        });
+      } catch (gradeError) {
+        console.error("Error grading trade:", gradeError);
+      }
+
+      try {
+        const walletAddress = await signer.getAddress();
+        await fetch("/api/trade-journal/close-open", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-wallet-address": walletAddress,
+          },
+          body: JSON.stringify({
+            coin: position.coin,
+            side: position.side,
+            exitPrice,
+            realizedPnl: position.unrealizedPnl,
+          }),
+        });
+      } catch (journalCloseErr) {
+        console.warn("[trade-journal] close-open:", journalCloseErr);
+      }
+      
+      // Refresh positions from the exchange to get updated state
+      await refreshAccount();
+      
+      return { success: true };
+    } catch (error: any) {
+      console.error("Error closing position:", error);
+      return { success: false, error: error.message || "Failed to close position" };
+    } finally {
+      setIsClosingPosition(false);
+    }
+  }, [positions, signer, refreshAccount, openOrders]);
+
+  const cancelHLOrder = useCallback(async (coin: string, oid: number): Promise<{ success: boolean; error?: string }> => {
+    if (!signer) {
+      return { success: false, error: "Wallet not connected" };
+    }
+    if (!oid || !Number.isFinite(oid)) {
+      return { success: false, error: "Invalid order id" };
+    }
+
+    try {
+      const result = await hlCancelOrder(signer, coin, oid);
+      // Always refetch so UI matches HL (success, failure, or stale list).
+      await refreshAccount();
+      return result;
+    } catch (error: any) {
+      console.error("Error cancelling order:", error);
+      await refreshAccount().catch(() => {});
+      return { success: false, error: error.message || "Failed to cancel order" };
+    }
+  }, [signer, refreshAccount]);
+
+  const placeTPSL = useCallback(async (
+    coin: string, 
+    size: number, 
+    isLong: boolean, 
+    tpPrice?: number, 
+    slPrice?: number,
+    entryPriceOverride?: number,
+    options?: PlaceTpslOptions,
+  ): Promise<{ success: boolean; error?: string }> => {
+    if (!signer) {
+      return { success: false, error: "Wallet not connected" };
+    }
+    if (isPlacingTPSLRef.current) {
+      console.warn("[placeTPSL] Already placing TP/SL, ignoring duplicate call");
+      return { success: false, error: "TP/SL placement already in progress" };
+    }
+    isPlacingTPSLRef.current = true;
+
+    try {
+      let pos = positions.find((p) => p.coin === coin && p.size > 0);
+      if (!pos && walletAddress && (tpPrice != null || slPrice != null)) {
+        const waited = await waitForClearinghousePosition(walletAddress, coin);
+        if (waited) pos = waitedPositionToPosition(waited);
+      }
+      const refPrice = entryPriceOverride || pos?.entryPrice || currentPrices[coin] || 0;
+      const markPrice = pos?.markPrice || currentPrices[coin] || refPrice;
+      const snapRef = markPrice > 0 ? markPrice : refPrice;
+
+      const { tpOrder, slOrder, tpPrice: liveTp, slPrice: liveSl } = selectTpSlOrders(
+        coin,
+        pos,
+        openOrders,
+      );
+
+      const tpSnap = tpPrice != null && tpPrice > 0 ? snapOrderPrice(tpPrice, snapRef) : null;
+      const slSnap = slPrice != null && slPrice > 0 ? snapOrderPrice(slPrice, snapRef) : null;
+      const liveTpSnap =
+        liveTp != null && liveTp > 0 ? snapOrderPrice(liveTp, snapRef) : null;
+      const liveSlSnap =
+        liveSl != null && liveSl > 0 ? snapOrderPrice(liveSl, snapRef) : null;
+
+      const updateTp = tpSnap != null && tpSnap !== liveTpSnap;
+      const updateSl = slSnap != null && slSnap !== liveSlSnap;
+
+      if (!updateTp && !updateSl) {
+        return { success: true };
+      }
+
+      if (refPrice > 0) {
+        const entryFmt = refPrice.toLocaleString(undefined, { maximumFractionDigits: 2 });
+        if (updateTp && tpSnap != null) {
+          if (isLong && tpSnap <= refPrice) {
+            return { success: false, error: `Take Profit ($${tpSnap.toLocaleString()}) must be above entry price ($${entryFmt}) for a Long.` };
+          }
+          if (!isLong && tpSnap >= refPrice) {
+            return { success: false, error: `Take Profit ($${tpSnap.toLocaleString()}) must be below entry price ($${entryFmt}) for a Short.` };
+          }
+          const tpMarkRef = markPrice > 0 ? markPrice : refPrice;
+          const tpMarkFmt = tpMarkRef.toLocaleString(undefined, { maximumFractionDigits: 2 });
+          if (isLong && tpSnap <= tpMarkRef) {
+            return { success: false, error: `Take Profit ($${tpSnap.toLocaleString()}) must be above the current price ($${tpMarkFmt}) — it would trigger immediately.` };
+          }
+          if (!isLong && tpSnap >= tpMarkRef) {
+            return { success: false, error: `Take Profit ($${tpSnap.toLocaleString()}) must be below the current price ($${tpMarkFmt}) — it would trigger immediately.` };
+          }
+        }
+        if (updateSl && slSnap != null) {
+          const slRef = markPrice > 0 ? markPrice : refPrice;
+          const slFmt = slRef.toLocaleString(undefined, { maximumFractionDigits: 2 });
+          if (isLong && slSnap >= slRef) {
+            return { success: false, error: `Stop Loss ($${slSnap.toLocaleString()}) must be below the current price ($${slFmt}) — it would trigger immediately.` };
+          }
+          if (!isLong && slSnap <= slRef) {
+            return { success: false, error: `Stop Loss ($${slSnap.toLocaleString()}) must be above the current price ($${slFmt}) — it would trigger immediately.` };
+          }
+        }
+      }
+
+      const results: Array<{ success: boolean; error?: string }> = [];
+      const useTrailingSl =
+        updateSl &&
+        options?.useNativeTrailingSl === true &&
+        options.slTrailingCallbackRate != null &&
+        options.slTrailingCallbackRate > 0;
+      const orderSize = pos?.size && pos.size > 0 ? pos.size : size;
+      if ((updateTp || updateSl) && orderSize <= 0) {
+        return {
+          success: false,
+          error: "Position size not available yet — wait a moment and set TP/SL again.",
+        };
+      }
+      let tpSynced = false;
+      let slSynced = false;
+
+      if (updateTp && tpSnap != null && tpOrder?.oid && walletAddress && hyperliquidSessionReady) {
+        const mod = await syncOrderToExchange(walletAddress, {
+          coin,
+          orderId: tpOrder.oid,
+          newPrice: tpSnap,
+          isBuy: !isLong,
+          size:
+            parseFloat(String(tpOrder.sz)) > 0 ? parseFloat(String(tpOrder.sz)) : orderSize,
+          tpsl: "tp",
+        });
+        if (mod.ok) {
+          tpSynced = true;
+        } else {
+          console.warn("[placeTPSL] TP modify failed, cancel+replace:", mod.error);
+        }
+      }
+
+      if (
+        updateSl &&
+        slSnap != null &&
+        !useTrailingSl &&
+        slOrder?.oid &&
+        walletAddress &&
+        hyperliquidSessionReady
+      ) {
+        const mod = await syncOrderToExchange(walletAddress, {
+          coin,
+          orderId: slOrder.oid,
+          newPrice: slSnap,
+          isBuy: !isLong,
+          size:
+            parseFloat(String(slOrder.sz)) > 0 ? parseFloat(String(slOrder.sz)) : orderSize,
+          tpsl: "sl",
+        });
+        if (mod.ok) {
+          slSynced = true;
+        } else {
+          console.warn("[placeTPSL] SL modify failed, cancel+replace:", mod.error);
+        }
+      }
+
+      if (tpSynced && (!updateSl || slSynced)) {
+        await refreshAccount();
+        if (walletAddress && pos && (updateTp || updateSl)) {
+          const { tpOk, slOk } = await verifyVenueTpslResting({
+            walletAddress,
+            coin,
+            position: pos,
+            snapRef,
+            expectedTp: updateTp ? tpSnap : null,
+            expectedSl: updateSl ? slSnap : null,
+          });
+          if (updateSl && slSnap != null && !slOk) {
+            return {
+              success: false,
+              error:
+                "Stop loss modify was not confirmed on Hyperliquid. Set SL again from the chart or Positions tab.",
+            };
+          }
+          if (updateTp && tpSnap != null && !tpOk) {
+            return {
+              success: false,
+              error:
+                "Take profit modify was not confirmed on Hyperliquid. Set TP again from the chart or Positions tab.",
+            };
+          }
+        }
+        return { success: true };
+      }
+
+      const ordersToCancel: Array<{ oid: number }> = [];
+      if (pos) {
+        for (const order of openOrders.filter((o) => o.coin === coin && isVenueTpslCandidate(o))) {
+          const kind = orderKindForTpsl(order, pos, markPrice);
+          const shouldCancel =
+            (kind === "tp" && updateTp && !tpSynced) ||
+            (kind === "sl" && updateSl && !slSynced);
+          if (shouldCancel && order.oid) {
+            ordersToCancel.push({ oid: order.oid });
+          }
+        }
+      }
+
+      if (updateTp && tpSnap != null && !tpSynced) {
+        const tpResult = await placeTriggerOrder(signer, {
+          coin,
+          isBuy: !isLong,
+          size: orderSize,
+          triggerPrice: tpSnap,
+          isStopLoss: false,
+          reduceOnly: true,
+        });
+        results.push(tpResult);
+      }
+
+      if (updateSl && slSnap != null && !slSynced) {
+        let slResult: { success: boolean; error?: string };
+        if (useTrailingSl) {
+          slResult = await placeTrailingStopMarketOrder(signer, {
+            coin,
+            isBuy: !isLong,
+            size: orderSize,
+            callbackRate: options!.slTrailingCallbackRate!,
+            anchorTriggerPx: slSnap,
+          });
+          if (!slResult.success) {
+            slResult = await placeTriggerOrder(signer, {
+              coin,
+              isBuy: !isLong,
+              size: orderSize,
+              triggerPrice: slSnap,
+              isStopLoss: true,
+              reduceOnly: true,
+            });
+          }
+        } else {
+          slResult = await placeTriggerOrder(signer, {
+            coin,
+            isBuy: !isLong,
+            size: orderSize,
+            triggerPrice: slSnap,
+            isStopLoss: true,
+            reduceOnly: true,
+          });
+        }
+        results.push(slResult);
+      }
+
+      const placeFailed = results.some((r) => !r.success);
+      if (!placeFailed) {
+        for (const { oid } of ordersToCancel) {
+          await hlCancelOrder(signer, coin, oid);
+        }
+      }
+
+      await refreshAccount();
+
+      const errors = results.filter((r) => !r.success).map((r) => r.error);
+      if (errors.length > 0) {
+        return { success: false, error: errors.join(", ") };
+      }
+
+      if (walletAddress && pos && (updateTp || updateSl)) {
+        const verifyPos = pos;
+        let { tpOk, slOk } = await verifyVenueTpslResting({
+          walletAddress,
+          coin,
+          position: verifyPos,
+          snapRef,
+          expectedTp: updateTp ? tpSnap : null,
+          expectedSl: updateSl ? slSnap : null,
+        });
+
+        if (updateSl && slSnap != null && !slOk && !slSynced) {
+          console.warn("[placeTPSL] SL not on venue after place — retrying once");
+          const retrySl = await placeTriggerOrder(signer, {
+            coin,
+            isBuy: !isLong,
+            size: orderSize,
+            triggerPrice: slSnap,
+            isStopLoss: true,
+            reduceOnly: true,
+          });
+          if (retrySl.success) {
+            await refreshAccount();
+            ({ tpOk, slOk } = await verifyVenueTpslResting({
+              walletAddress,
+              coin,
+              position: verifyPos,
+              snapRef,
+              expectedTp: updateTp ? tpSnap : null,
+              expectedSl: slSnap,
+              attempts: 4,
+            }));
+          } else {
+            return {
+              success: false,
+              error:
+                retrySl.error ||
+                "Stop loss was not confirmed on Hyperliquid. Check open orders on app.hyperliquid.xyz.",
+            };
+          }
+        }
+
+        if (updateTp && tpSnap != null && !tpOk && !tpSynced) {
+          const retryTp = await placeTriggerOrder(signer, {
+            coin,
+            isBuy: !isLong,
+            size: orderSize,
+            triggerPrice: tpSnap,
+            isStopLoss: false,
+            reduceOnly: true,
+          });
+          if (!retryTp.success) {
+            return {
+              success: false,
+              error:
+                retryTp.error ||
+                "Take profit was not confirmed on Hyperliquid. Check open orders on app.hyperliquid.xyz.",
+            };
+          }
+          await refreshAccount();
+          ({ tpOk, slOk } = await verifyVenueTpslResting({
+            walletAddress,
+            coin,
+            position: verifyPos,
+            snapRef,
+            expectedTp: tpSnap,
+            expectedSl: updateSl ? slSnap : null,
+            attempts: 4,
+          }));
+        }
+
+        if (updateSl && slSnap != null && !slOk) {
+          return {
+            success: false,
+            error:
+              "Stop loss is not resting on Hyperliquid — your position may be unprotected. Set SL again from the chart or Positions tab.",
+          };
+        }
+        if (updateTp && tpSnap != null && !tpOk) {
+          return {
+            success: false,
+            error:
+              "Take profit is not resting on Hyperliquid. Set TP again from the chart or Positions tab.",
+          };
+        }
+      } else if (walletAddress && !pos && updateSl && slSnap != null) {
+        return {
+          success: false,
+          error:
+            "No open position found on Hyperliquid — stop loss was not placed. Refresh and try again.",
+        };
+      }
+
+      return { success: true };
+    } catch (error: any) {
+      console.error("Error placing TP/SL:", error);
+      return { success: false, error: error.message || "Failed to place TP/SL" };
+    } finally {
+      isPlacingTPSLRef.current = false;
+    }
+  }, [signer, openOrders, positions, refreshAccount, currentPrices, walletAddress, hyperliquidSessionReady]);
+
+  const setIndicators = useCallback((newIndicators: Indicator[]) => {
+    setIndicatorsState(newIndicators);
+  }, []);
+
+  const updatePrices = useCallback((prices: Record<string, number>) => {
+    setCurrentPrices(prices);
+  }, []);
+
+  const isPriceReady = useCallback((coin: string): boolean => {
+    const price = currentPrices[coin];
+    return typeof price === 'number' && price > 0;
+  }, [currentPrices]);
+
+  useEffect(() => {
+    if (Object.keys(currentPrices).length === 0) return;
+
+    setPositions(prev => prev.map(pos => {
+      const markPrice = currentPrices[pos.coin] || pos.markPrice;
+      const priceDiff = pos.side === "long" 
+        ? markPrice - pos.entryPrice 
+        : pos.entryPrice - markPrice;
+      const unrealizedPnl = priceDiff * pos.size;
+      const unrealizedPnlPercent = pos.margin > 0 ? (unrealizedPnl / pos.margin) * 100 : 0;
+      
+      return {
+        ...pos,
+        markPrice,
+        unrealizedPnl,
+        unrealizedPnlPercent,
+      };
+    }));
+  }, [currentPrices]);
+
+  return (
+    <TradingContext.Provider value={{
+      connected,
+      address,
+      balance,
+      withdrawable,
+      accountValue,
+      spotUsdcTotal,
+      spotUsdcAvailable,
+      unifiedAccountUsd,
+      walletUsdcArbitrum,
+      walletUsdcBridged,
+      walletUsdcTotal,
+      walletEthArbitrum,
+      displayTotalUsd,
+      isLoadingWalletUsdc: !walletUsdcReady,
+      walletUsdcReady,
+      refreshWalletUsdc,
+      marginUsed,
+      positions,
+      openOrders,
+      hlFrontendOpenOrdersRaw,
+      hlAccountSyncAt,
+      hlAccountFetchError,
+      tradeHistory,
+      indicators,
+      currentPrices,
+      isPriceReady,
+      isLoadingAccount,
+      isClosingPosition,
+      connect,
+      disconnect,
+      closePosition,
+      cancelHLOrder,
+      placeTPSL,
+      setIndicators,
+      updatePrices,
+      refreshAccount,
+    }}>
+      {children}
+    </TradingContext.Provider>
+  );
+}
+
+export function useTrading() {
+  const context = useContext(TradingContext);
+  if (!context) {
+    throw new Error("useTrading must be used within a TradingProvider");
+  }
+  return context;
+}
