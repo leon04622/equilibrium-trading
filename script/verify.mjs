@@ -106,8 +106,10 @@ try {
   console.log("verify: ✓ GET /api/hyperliquid/candles/BTC");
 
   // Ensures bundled CJS + p-limit (educational scan) work — regression caught on Railway.
+  // Route is Pro-gated; built-in admin wallet is always entitled (see routes.ts).
   const pat = await fetch(
-    `${base}/api/signals/patterns?coins=BTC&timeframes=1h`
+    `${base}/api/signals/patterns?coins=BTC&timeframes=1h`,
+    { headers: { "x-wallet-address": "0x115560812df8e7515eecc957b6796531e936edd9" } },
   );
   if (!pat.ok) throw new Error(`/api/signals/patterns ${pat.status}`);
   const patterns = await pat.json();
