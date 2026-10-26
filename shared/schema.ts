@@ -744,6 +744,16 @@ export const MASTER_BYPASS_WALLET_ADDRESSES: readonly string[] = [
   "0x115560812df8e7515eecc957b6796531e936edd9",
 ];
 
+/**
+ * Extra EOAs that inherit Pro/Mentor from the master bypass wallet.
+ * Includes Hyperliquid sub-accounts and imported keys used to log into EQ.
+ * These are **not** Command Center admins.
+ */
+export const MASTER_BYPASS_INHERITED_ADDRESSES: readonly string[] = [
+  "0xb454540da95846f2fecd7f13f01e9d0b5b7dc656",
+  "0xb0b91364acdb9552a95d894c10ffe6cf81a9a3e0",
+];
+
 export function isAdminWallet(walletAddress: string | null): boolean {
   if (!walletAddress) return false;
   const a = walletAddress.toLowerCase();
@@ -753,7 +763,10 @@ export function isAdminWallet(walletAddress: string | null): boolean {
 export function isMasterBypassWalletInList(walletAddress: string | null | undefined): boolean {
   if (!walletAddress?.trim()) return false;
   const a = walletAddress.trim().toLowerCase();
-  return MASTER_BYPASS_WALLET_ADDRESSES.some((w) => w.toLowerCase() === a);
+  return (
+    MASTER_BYPASS_WALLET_ADDRESSES.some((w) => w.toLowerCase() === a) ||
+    MASTER_BYPASS_INHERITED_ADDRESSES.some((w) => w.toLowerCase() === a)
+  );
 }
 
 // Re-export chat models

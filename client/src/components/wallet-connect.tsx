@@ -28,6 +28,7 @@ export function WalletConnect() {
     connect,
     isConnecting,
     pendingConnectAccounts,
+    cancelPendingConnect,
   } = useWallet();
   const { walletUsdcArbitrum, displayTotalUsd, isLoadingWalletUsdc } = useTrading();
 
@@ -44,7 +45,10 @@ export function WalletConnect() {
     return (
       <WalletConnectSheet
         open={accountPickOpen}
-        onOpenChange={setAccountPickOpen}
+        onOpenChange={(open) => {
+          setAccountPickOpen(open);
+          if (!open) cancelPendingConnect();
+        }}
         trigger={
           pendingConnectAccounts && pendingConnectAccounts.length > 0 ? (
             <Button variant="outline" className="gap-2" data-testid="button-pick-account">
