@@ -60,6 +60,8 @@ interface EducationalPatternSignal {
   detectedAt: string;
   tradeable: boolean;
   maFilterReason: string;
+  qualityScore?: number;
+  lifecycle?: string;
   counterTrend?: boolean;
   volumeConfirmed?: boolean;
   marketBiasLabel?: string;
@@ -1538,6 +1540,12 @@ function PatternChartComponent({
                   ? "✓ Pattern visible — geometry-first scanner"
                   : "⚠ Context note — review SMMA copy on card"}
               </p>
+              {typeof activeSignal.qualityScore === "number" && (
+                <p className="text-[9px] text-[#c5d0e0] mt-0.5">
+                  Quality {activeSignal.qualityScore}/100
+                  {activeSignal.lifecycle ? ` · ${activeSignal.lifecycle.replaceAll("_", " ")}` : ""}
+                </p>
+              )}
             </div>
 
             {/* MA filter reason */}

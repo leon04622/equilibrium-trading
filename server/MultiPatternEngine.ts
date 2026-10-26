@@ -2,8 +2,7 @@
  * Multi-pattern scan: runs geometry detectors (flags, triangles, doubles, wedges), Apex pole+flag,
  * strict volume flags, and H&S family.
  *
- * **Bull vs bear flags:** continuation flags are aligned with 21/200 SMMA trend (and neutral-MA
- * momentum) so a bearish chart cannot surface a bull flag just because geometry scored higher.
+ * Geometry is always collected. 21/200 SMMA is trade *eligibility* context, not a detection veto.
  */
 import type { HyperliquidCandle } from "./hyperliquid";
 import {
@@ -17,28 +16,25 @@ import {
 import { runApexGeometricFlagScan, type ApexGeometricResult } from "./ApexDetectionEngine";
 import { detectHeadAndShoulders, detectInverseHeadAndShoulders } from "./pattern-shoulders";
 import { detectStrictFlagWithVolume } from "./pattern-strict-volume";
+import { enrichDetectedPattern } from "./pattern-enrichment";
+import { normalizeOhlcv } from "@shared/ohlcv-normalize";
+import { classifySmmaTrend } from "@shared/smma";
+import { wilderAtr } from "@shared/atr";
 
-/**
- * Bull/bear flags are continuation patterns. If 21 SMMA is below 200, do not emit a bull flag; if above,
- * do not emit a bear flag. When MAs are neutral, use ~48-bar momentum so obvious downtrends are not
- * labeled as bull flags.
- */
-function flagAgreesWithTrendContext(
+/** @deprecated SMMA must not veto geometry. Kept for tests comparing baseline vs upgrade. */
+export function flagAgreesWithTrendContext(
   p: DetectedPattern,
   sma: SMAValues | null,
   candles: HyperliquidCandle[],
 ): boolean {
   if (p.name !== "bull_flag" && p.name !== "bear_flag") return true;
   if (!sma) return true;
-
   const rel = (sma.sma21 - sma.sma200) / Math.max(Math.abs(sma.sma200), 1e-12);
   const neutralMa = Math.abs(rel) < 0.0035;
-
   if (!neutralMa) {
     if (p.name === "bull_flag") return rel > 0;
     if (p.name === "bear_flag") return rel < 0;
   }
-
   const closes = candles.slice(-48).map((c) => parseFloat(c.c));
   if (closes.length < 20) return true;
   const netPct = ((closes[closes.length - 1] - closes[0]) / Math.max(closes[0], 1e-12)) * 100;
@@ -124,57 +120,74 @@ function applyBeginnerOpposingFilters(rows: MultiPatternGatherRow[]): MultiPatte
 export function gatherMultiPatternCandidates(
   candles: HyperliquidCandle[],
   timeframe: string,
+  options?: { smmaVetoFlags?: boolean; nowMs?: number },
 ): { rows: MultiPatternGatherRow[]; apexResult: ApexGeometricResult } {
-  const sma = calculateSMAFromCandles(candles);
-  const apexResult = runApexGeometricFlagScan(candles, timeframe);
+  const norm = normalizeOhlcv(candles, timeframe);
+  const series = norm.bars;
+  const sma = calculateSMAFromCandles(series);
+  const apexResult = runApexGeometricFlagScan(series, timeframe);
   const candMap = new Map<string, { p: DetectedPattern; volumeOk: boolean }>();
+  const veto = options?.smmaVetoFlags === true;
 
-  const base = collectPatternCandidates(candles, timeframe);
+  const base = collectPatternCandidates(series, timeframe);
   sortPatternCandidatesByActionability(base);
   for (const p of base) {
-    if (!flagAgreesWithTrendContext(p, sma, candles)) continue;
+    if (veto && !flagAgreesWithTrendContext(p, sma, series)) continue;
     upsertByScore(candMap, { p, volumeOk: false });
   }
 
-  if (apexResult.pattern && flagAgreesWithTrendContext(apexResult.pattern, sma, candles)) {
+  if (apexResult.pattern && (!veto || flagAgreesWithTrendContext(apexResult.pattern, sma, series))) {
     upsertByScore(candMap, { p: apexResult.pattern, volumeOk: !!apexResult.volumeOk });
   }
 
-  const hs = detectHeadAndShoulders(candles);
+  const hs = detectHeadAndShoulders(series);
   if (hs) upsertByScore(candMap, { p: hs, volumeOk: false });
-  const ihs = detectInverseHeadAndShoulders(candles);
+  const ihs = detectInverseHeadAndShoulders(series);
   if (ihs) upsertByScore(candMap, { p: ihs, volumeOk: false });
 
-  const strictBull = detectStrictFlagWithVolume(candles, true);
-  if (strictBull && flagAgreesWithTrendContext(strictBull.pattern, sma, candles)) {
+  const strictBull = detectStrictFlagWithVolume(series, true);
+  if (strictBull && (!veto || flagAgreesWithTrendContext(strictBull.pattern, sma, series))) {
     upsertByScore(candMap, { p: strictBull.pattern, volumeOk: strictBull.volumeOk });
   }
-  const strictBear = detectStrictFlagWithVolume(candles, false);
-  if (strictBear && flagAgreesWithTrendContext(strictBear.pattern, sma, candles)) {
+  const strictBear = detectStrictFlagWithVolume(series, false);
+  if (strictBear && (!veto || flagAgreesWithTrendContext(strictBear.pattern, sma, series))) {
     upsertByScore(candMap, { p: strictBear.pattern, volumeOk: strictBear.volumeOk });
   }
 
+  const closes = series.map((c) => parseFloat(c.c));
+  const atr = wilderAtr(series);
+  const htf = classifySmmaTrend(closes, atr);
+
+  const enriched = [...candMap.values()].map((row) => ({
+    p: enrichDetectedPattern(row.p, series, timeframe, {
+      volumeOk: row.volumeOk,
+      dataGaps: norm.gaps,
+      nowMs: options?.nowMs,
+      mtfAligned:
+        !!htf &&
+        ((row.p.name.includes("bull") && htf.regime === "bullish") ||
+          (row.p.name.includes("bear") && htf.regime === "bearish")),
+    }),
+    volumeOk: row.volumeOk,
+  }));
+
   const rows = applyBeginnerOpposingFilters(
-    [...candMap.values()].sort(
-      (a, b) => scoreCandidate(b.p, b.volumeOk) - scoreCandidate(a.p, a.volumeOk),
-    ),
+    enriched.sort((a, b) => scoreCandidate(b.p, b.volumeOk) - scoreCandidate(a.p, a.volumeOk)),
   );
 
   let apexForUi = apexResult;
-  if (
-    apexResult.pattern &&
-    (apexResult.pattern.name === "bull_flag" || apexResult.pattern.name === "bear_flag") &&
-    !flagAgreesWithTrendContext(apexResult.pattern, sma, candles)
-  ) {
+  if (apexResult.pattern) {
+    const apexEnriched = rows.find((r) => r.p.name === apexResult.pattern!.name);
     apexForUi = {
       ...apexResult,
-      pattern: null,
-      scanState: "no_pattern",
-      note: "Apex flag geometry disagreed with trend context (21/200 SMMA + recent momentum).",
-      volumeOk: undefined,
-      poleMovePct: undefined,
-      poleBodyRatio: undefined,
-      retraceRatio: undefined,
+      pattern: apexEnriched?.p ?? enrichDetectedPattern(apexResult.pattern, series, timeframe, {
+        volumeOk: !!apexResult.volumeOk,
+        dataGaps: norm.gaps,
+        nowMs: options?.nowMs,
+      }),
+      note: veto
+        ? apexResult.note
+        : `${apexResult.note} SMMA is context only (not a geometry veto).`,
     };
   }
 

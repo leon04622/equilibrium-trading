@@ -104,6 +104,8 @@ export interface EducationalPatternSignal {
   detectedAt: Date;
   tradeable: boolean;
   maFilterReason: string;
+  qualityScore?: number;
+  lifecycle?: string;
   /** Pattern structure opposes SMMA + swing-defined market bias */
   counterTrend?: boolean;
   /** Strict flag: volume softer in flag vs pole */
@@ -275,8 +277,8 @@ function buildEducationalSignalFromCandidate(
 
   const price = currentSMA.price;
   const { sma21: s21, sma200: s200 } = currentSMA;
-  const tradeable = true;
-  let maFilterReason = "";
+  const tradeable = best.p.tradeEligible !== false;
+  let maFilterReason = best.p.tradeEligibilityReason || "";
   if (structural === "bullish") {
     const aligned = price > s21 && price > s200;
     maFilterReason = aligned
@@ -325,6 +327,8 @@ function buildEducationalSignalFromCandidate(
     bias,
     patternName,
     patternStatus,
+    qualityScore: best.p.qualityScore,
+    lifecycle: best.p.lifecycle,
     sma21: s21,
     sma200: s200,
     currentPrice: price,

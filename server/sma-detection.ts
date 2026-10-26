@@ -13,6 +13,8 @@
 
 import pLimit from "p-limit";
 import { getCandles, HyperliquidCandle } from "./hyperliquid";
+import { lastSmma } from "@shared/smma";
+import { wilderAtr } from "@shared/atr";
 
 const DEFAULT_SCAN_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "1d"];
 
@@ -22,6 +24,17 @@ export interface SMAValues {
   price: number;
   timestamp: number;
 }
+
+export type PatternLifecycle =
+  | "candidate"
+  | "developing"
+  | "breakout_pending"
+  | "confirmed"
+  | "retest"
+  | "invalidated"
+  | "expired";
+
+export type QualityFactor = { name: string; points: number; note: string };
 
 export type PatternName = 
   | "bull_flag" | "bear_flag" 
@@ -42,6 +55,14 @@ export interface DetectedPattern {
   breakoutLevel: number;
   currentPrice: number;
   confidence: number;
+  /** Explicit lifecycle — geometry can exist without trade eligibility. */
+  lifecycle?: PatternLifecycle;
+  lifecycleReason?: string;
+  qualityScore?: number;
+  qualityFactors?: QualityFactor[];
+  tradeEligible?: boolean;
+  tradeEligibilityReason?: string;
+  smmaRegime?: string;
 }
 
 export interface CrossoverSignal {
@@ -159,15 +180,8 @@ function scanPatternWindows(
   return [best];
 }
 
-// SMMA (Smoothed Moving Average) — matches Hyperliquid exactly
-// First value = SMA of first `period` bars; then SMMA = (prev * (period-1) + close) / period
 function calculateSMMA(prices: number[], period: number): number | null {
-  if (prices.length < period) return null;
-  let smma = prices.slice(0, period).reduce((sum, p) => sum + p, 0) / period;
-  for (let i = period; i < prices.length; i++) {
-    smma = (smma * (period - 1) + prices[i]) / period;
-  }
-  return smma;
+  return lastSmma(prices, period);
 }
 
 export function calculateSMAFromCandles(candles: HyperliquidCandle[]): SMAValues | null {
@@ -251,7 +265,10 @@ function detectFlagPatternInFixedWindow(
     const poleHeight     = poleTop - poleBottom;
     const poleHeightPct  = (poleHeight / poleBottom) * 100;
 
-    if (poleHeightPct < thresholds.minMovePercent * poleMinMult) return null;
+    const atr = wilderAtr(window);
+    const atrFloorPct = atr && poleBottom > 0 ? ((atr * 1.15) / poleBottom) * 100 : 0;
+    const minPolePct = Math.max(thresholds.minMovePercent * poleMinMult, atrFloorPct);
+    if (poleHeightPct < minPolePct) return null;
     // Pole must end ABOVE where it started (genuinely bullish impulse)
     if (poleTop <= poleBottom) return null;
 
@@ -312,7 +329,10 @@ function detectFlagPatternInFixedWindow(
     const poleHeight     = poleTop - poleBottom;
     const poleHeightPct  = (poleHeight / poleTop) * 100;
 
-    if (poleHeightPct < thresholds.minMovePercent * poleMinMult) return null;
+    const atrBear = wilderAtr(window);
+    const atrFloorBearPct = atrBear && poleTop > 0 ? ((atrBear * 1.15) / poleTop) * 100 : 0;
+    const minPoleBearPct = Math.max(thresholds.minMovePercent * poleMinMult, atrFloorBearPct);
+    if (poleHeightPct < minPoleBearPct) return null;
     if (poleBottom >= poleTop) return null;
 
     // ── FLAG: tight upward-sloping consolidation after the pole ──────────────

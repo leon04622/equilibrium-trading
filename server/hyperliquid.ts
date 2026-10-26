@@ -1,5 +1,6 @@
 // Hyperliquid API Integration for real-time market data
 // Using Hyperliquid's public API endpoints
+import { normalizeOhlcv } from "@shared/ohlcv-normalize";
 
 const HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info";
 let cachedPerpUniverseCoins: string[] = [];
@@ -446,12 +447,12 @@ export async function getCandles(
       }
 
       const raw: HyperliquidCandle[] = await response.json();
-      const sorted = [...raw].sort((a, b) => a.t - b.t);
+      const { bars } = normalizeOhlcv(raw, interval);
       // HL returns chronological bars; keep only the most recent `candleCount` for this request.
-      if (!startTime && !endTime && sorted.length > candleCount) {
-        return sorted.slice(-candleCount);
+      if (!startTime && !endTime && bars.length > candleCount) {
+        return bars.slice(-candleCount);
       }
-      return sorted;
+      return bars;
     };
 
     let data = await fetchSnapshot();

@@ -1,21 +1,18 @@
 import type { Time } from "lightweight-charts";
+import { smmaSeries } from "@shared/smma";
 
-/** SMMA (Smoothed Moving Average) — matches native venue chart math; do not change formula. */
+/** SMMA (Smoothed Moving Average) — TradingView RMA / venue-native formula. */
 export function calcSMMA(
   vals: number[],
   times: Time[],
   period: number,
 ): { time: Time; value: number }[] {
-  if (vals.length < period) return [];
+  const series = smmaSeries(vals, period);
   const out: { time: Time; value: number }[] = [];
-  let prev = 0;
-  for (let i = 0; i < period; i++) prev += vals[i];
-  prev /= period;
-  out.push({ time: times[period - 1], value: prev });
-  for (let i = period; i < vals.length; i++) {
-    const smma = (prev * (period - 1) + vals[i]) / period;
-    out.push({ time: times[i], value: smma });
-    prev = smma;
+  for (let i = 0; i < series.length; i++) {
+    const value = series[i];
+    if (value == null) continue;
+    out.push({ time: times[i]!, value });
   }
   return out;
 }
